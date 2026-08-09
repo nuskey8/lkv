@@ -34,10 +34,7 @@ jobs:
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal
 
-      - name: Test default features
-        run: cargo +stable test --workspace --locked
-
-      - name: Test FFI
+      - name: Test
         run: cargo +stable test --workspace --locked --features ffi
 
   lint:

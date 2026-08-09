@@ -25,20 +25,7 @@ rustc-hash = "=2.1.3"
 xxhash-rust = { version = "=0.8.18", features = ["xxh3"] }
 
 [dev-dependencies]
-fjall = "3.1.8"
-heed = "0.22.1"
-jammdb = "0.11.0"
-libc = "0.2.177"
-redb = "4.1.0"
-rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "bindgen-runtime"] }
-rusqlite = { version = "0.38.0", features = ["bundled"] }
-sled = "0.34.7"
 tempfile = "3.5.0"
-
-[[bench]]
-name = "comparison"
-harness = true
-required-features = ["nightly"]
 
 [[bench]]
 name = "large_values"

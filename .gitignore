@@ -1,4 +1,5 @@
 /target
+/benches/target
 /fuzz/artifacts
 /fuzz/corpus
 /fuzz/target
