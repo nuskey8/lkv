@@ -6,6 +6,8 @@ mod common;
 
 #[path = "comparison/fjall.rs"]
 mod fjall;
+#[path = "comparison/hashmap.rs"]
+mod hashmap;
 #[path = "comparison/heed.rs"]
 mod heed;
 #[path = "comparison/jammdb.rs"]
