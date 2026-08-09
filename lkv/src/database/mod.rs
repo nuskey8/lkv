@@ -639,15 +639,12 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    Ok(directory.sync_all()?)
+fn sync_directory(_path: &Path) -> Result<()> {
+    // Windows can open a directory with FILE_FLAG_BACKUP_SEMANTICS, but
+    // FlushFileBuffers requires a writable file handle and does not support
+    // flushing a directory handle. The database file itself is synced before
+    // publishing it, so directory syncing is intentionally a no-op here.
+    Ok(())
 }
 
 fn initialize_file(file: &mut File) -> Result<()> {
