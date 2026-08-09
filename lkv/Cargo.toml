@@ -6,7 +6,7 @@ rust-version = "1.90"
 autobenches = false
 description = "A lightweight and fast embedded key-value store for Rust."
 readme = "../README.md"
-license = "../LICENSE"
+license-file = "../LICENSE"
 documentation = "https://docs.rs/lkv"
 repository = "https://github.com/nuskey8/lkv"
 
