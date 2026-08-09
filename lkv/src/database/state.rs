@@ -21,7 +21,10 @@ pub const MAPPED_VALUE_THRESHOLD: usize = 1024 * 1024;
 #[derive(Clone)]
 pub enum BaseBytes {
     Mapped(Arc<Mmap>),
-    Memory(Arc<[u8]>),
+    Memory {
+        bytes: Arc<Vec<u8>>,
+        range: Range<usize>,
+    },
 }
 
 impl Deref for BaseBytes {
@@ -30,7 +33,7 @@ impl Deref for BaseBytes {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Mapped(mapping) => mapping,
-            Self::Memory(bytes) => bytes,
+            Self::Memory { bytes, range } => &bytes[range.clone()],
         }
     }
 }

@@ -1,5 +1,39 @@
 use super::*;
 
+fn assert_memory_base_is_shared(database: &Database) {
+    let BaseBytes::Memory { bytes, .. } = &database.base.mapping else {
+        panic!("memory database Base must use memory bytes");
+    };
+    let storage_bytes = database
+        .storage
+        .memory_base_mapping()
+        .expect("memory storage must retain the active Base");
+    assert!(Arc::ptr_eq(bytes, storage_bytes));
+}
+
+#[test]
+fn memory_storage_shares_base_while_overlay_grows() -> Result<()> {
+    let mut db = Database::memory()?;
+    assert_memory_base_is_shared(&db);
+    let materialized = db.storage.memory_materialized_bytes().unwrap();
+    let initial = match &db.base.mapping {
+        BaseBytes::Memory { bytes, .. } => Arc::clone(bytes),
+        BaseBytes::Mapped(_) => unreachable!(),
+    };
+
+    db.put(b"overlay", b"value")?;
+
+    let current = match &db.base.mapping {
+        BaseBytes::Memory { bytes, .. } => bytes,
+        BaseBytes::Mapped(_) => unreachable!(),
+    };
+    assert!(Arc::ptr_eq(&initial, current));
+    assert_memory_base_is_shared(&db);
+    assert_eq!(db.storage.memory_materialized_bytes(), Some(materialized));
+    assert!(db.stats()?.storage_bytes as usize > materialized);
+    Ok(())
+}
+
 #[test]
 #[cfg(not(windows))]
 fn single_file_compact_and_vacuum() -> Result<()> {
@@ -76,6 +110,7 @@ fn failed_published_base_install_poisons_the_handle() -> Result<()> {
 #[test]
 fn stats_describe_active_storage_without_scanning() -> Result<()> {
     let mut db = Database::memory()?;
+    assert_memory_base_is_shared(&db);
     let initial = db.stats()?;
     assert_eq!(initial.generation, 1);
     assert_eq!(initial.base_entries, 0);
@@ -95,6 +130,7 @@ fn stats_describe_active_storage_without_scanning() -> Result<()> {
     assert_eq!(overlay.overlay_memory_bytes, db.overlay_memory_usage());
 
     db.compact()?;
+    assert_memory_base_is_shared(&db);
     let compacted = db.stats()?;
     assert_eq!(compacted.generation, 2);
     assert_eq!(compacted.base_entries, 1);
@@ -103,6 +139,7 @@ fn stats_describe_active_storage_without_scanning() -> Result<()> {
     assert!(compacted.stale_bytes > 0);
 
     db.vacuum()?;
+    assert_memory_base_is_shared(&db);
     let vacuumed = db.stats()?;
     assert_eq!(vacuumed.generation, 3);
     assert_eq!(vacuumed.base_entries, 1);
