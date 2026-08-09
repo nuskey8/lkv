@@ -3,7 +3,7 @@
 ![CI](https://github.com/nuskey8/lkv/actions/workflows/ci.yml/badge.svg)
 [![Crates.io](https://img.shields.io/crates/v/lkv.svg)](https://crates.io/crates/lkv)
 [![Documentation](https://docs.rs/lkv/badge.svg)](https://docs.rs/lkv)
-[![License](https://img.shields.io/crates/l/lkv)](https://crates.io/crates/lkv)
+![GitHub License](https://img.shields.io/github/license/nuskey8/lkv)
 
 A lightweight and fast embedded key-value store for Rust.
 
