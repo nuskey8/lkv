@@ -45,7 +45,7 @@ fn validate_options(options: &DatabaseOptions) -> Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct DatabaseStats {
-    /// Total bytes in the file or volatile serialized image.
+    /// Total bytes in the file or logical volatile serialized image.
     pub storage_bytes: u64,
     /// Bytes occupied by the active immutable Base segment.
     pub base_bytes: u64,
@@ -54,7 +54,7 @@ pub struct DatabaseStats {
     pub base_entries: usize,
     /// Latest Overlay keys, including tombstones.
     pub overlay_entries: usize,
-    /// Bytes occupied by active Overlay records in the serialized image.
+    /// Bytes occupied by active Overlay records in the logical serialized image.
     pub overlay_log_bytes: u64,
     /// Soft memory charge for active Overlay keys and inline-sized values.
     /// Recovered inline values remain charged even when mmap-backed so the
@@ -286,7 +286,28 @@ impl Database {
         staged: KeyMap<OverlayEntry>,
         value_checksums: KeyMap<u32>,
     ) -> Result<()> {
-        self.commit_staged_with(staged, value_checksums, append_batch)
+        if self.storage.is_memory() {
+            self.commit_staged_memory(staged)
+        } else {
+            self.commit_staged_with(staged, value_checksums, append_batch)
+        }
+    }
+
+    fn commit_staged_memory(&mut self, staged: KeyMap<OverlayEntry>) -> Result<()> {
+        self.ensure_writable()?;
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let payload_len = batch_payload_len(&staged)? as u64;
+        let batch_record_len = (LOG_HEADER_SIZE as u64)
+            .checked_add(payload_len)
+            .ok_or_else(|| Error::from_io(ErrorKind::InvalidInput, "batch record size overflow"))?;
+        self.ensure_capacity(batch_record_len)?;
+        self.storage.extend_memory_log(batch_record_len)?;
+        for (key, entry) in staged {
+            self.set_overlay_entry(key, entry);
+        }
+        Ok(())
     }
 
     fn commit_staged_with(

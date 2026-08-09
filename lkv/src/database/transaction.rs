@@ -69,12 +69,13 @@ impl<'db> WriteTransaction<'db> {
         let value = value.as_ref();
         check_lengths(key, value)?;
         check_single_put_size(key.len(), value.len())?;
-        let (value, value_checksum) = if value.len() >= MAPPED_VALUE_THRESHOLD {
-            let (value, checksum) = copy_value(value)?;
-            (value, Some(checksum))
-        } else {
-            (ValueBytes::Owned(value.to_vec()), None)
-        };
+        let (value, value_checksum) =
+            if value.len() >= MAPPED_VALUE_THRESHOLD && !self.db.storage_is_memory() {
+                let (value, checksum) = copy_value(value)?;
+                (value, Some(checksum))
+            } else {
+                (ValueBytes::Owned(value.to_vec()), None)
+            };
         if let Some(checksum) = value_checksum {
             self.value_checksums.insert(key.to_vec(), checksum);
         } else {
@@ -138,8 +139,10 @@ impl<'db> WriteTransaction<'db> {
             value.resize(value_len, 0);
             let checksum;
             {
-                let mut reserved =
-                    ReservedValue::new(&mut value, value_len >= MAPPED_VALUE_THRESHOLD);
+                let mut reserved = ReservedValue::new(
+                    &mut value,
+                    value_len >= MAPPED_VALUE_THRESHOLD && !self.db.storage_is_memory(),
+                );
                 write(&mut reserved)?;
                 reserved.require_complete()?;
                 checksum = reserved.checksum();
