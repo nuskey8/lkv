@@ -7,6 +7,8 @@
 
 A lightweight and fast embedded key-value store for Rust.
 
+![bench](docs/bench.png)
+
 ## Overview
 
 lkv is a lightweight and fast embedded database implemented in Rust. It is designed specifically for read performance based on hash tables and memory efficiency, featuring faster lookups than LMDB, sled, redb, and others.

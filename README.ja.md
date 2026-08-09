@@ -7,6 +7,8 @@
 
 A lightweight and fast embedded key-value store for Rust.
 
+![bench](docs/bench.png)
+
 ## 概要
 
 lkvはRust実装の軽量かつ高速な組み込みDBです。ハッシュテーブルをベースとした読み取り性能や省メモリに特化した設計になっており、LMDBやsled、redbなどよりも高速なルックアップを特徴としています。
