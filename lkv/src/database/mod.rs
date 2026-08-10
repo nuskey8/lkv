@@ -466,13 +466,6 @@ impl Database {
         }
     }
 
-    /// Soft memory charge for active Overlay keys and inline-sized values,
-    /// excluding HashMap bucket/allocator overhead. Recovered inline values
-    /// remain charged even when mmap-backed.
-    pub fn overlay_memory_usage(&self) -> usize {
-        self.overlay.memory
-    }
-
     fn set_overlay_entry(&mut self, key: Vec<u8>, entry: OverlayEntry) {
         self.overlay.set(key, entry);
     }

@@ -210,7 +210,7 @@ fn stats_describe_active_storage_without_scanning() -> Result<()> {
     assert_eq!(overlay.base_entries, 0);
     assert_eq!(overlay.overlay_entries, 2);
     assert!(overlay.overlay_log_bytes > 0);
-    assert_eq!(overlay.overlay_memory_bytes, db.overlay_memory_usage());
+    assert_eq!(overlay.overlay_memory_bytes, db.overlay.memory);
 
     db.compact()?;
     assert_memory_base_is_shared(&db);

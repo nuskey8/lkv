@@ -504,20 +504,6 @@ pub unsafe extern "C" fn lkv_database_len(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lkv_database_overlay_memory_usage(
-    database: *const lkv_database,
-    output: *mut usize,
-) -> lkv_status {
-    ffi_call(|| {
-        // SAFETY: pointers are checked before use.
-        let database = unsafe { required_ref(database, "database")? };
-        let output = unsafe { required_mut(output, "output")? };
-        *output = read_database(database)?.overlay_memory_usage();
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lkv_database_get_stats(
     database: *const lkv_database,
     output: *mut lkv_database_stats,
