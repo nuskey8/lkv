@@ -157,7 +157,7 @@ fn overlay_limit_requires_explicit_compaction() -> Result<()> {
     ));
     assert_eq!(db.get(b"large")?, Some(&[b'x'; 100][..]));
     db.compact()?;
-    assert_eq!(db.overlay_memory_usage(), 0);
+    assert_eq!(db.stats()?.overlay_memory_bytes, 0);
     db.begin_write()?.abort();
     assert_eq!(db.get(b"large")?, Some(&[b'x'; 100][..]));
     drop(db);
@@ -267,7 +267,7 @@ fn memory_database_supports_transactions_snapshots_and_maintenance() -> Result<(
     );
     drop(snapshot);
     db.compact()?;
-    assert_eq!(db.overlay_memory_usage(), 0);
+    assert_eq!(db.stats()?.overlay_memory_bytes, 0);
     db.verify()?;
     assert_eq!(db.get(b"other")?, Some(b"two".as_slice()));
     drop(db);
@@ -314,13 +314,13 @@ fn large_values_are_transparently_mapped_and_survive_recovery() -> Result<()> {
     transaction.commit()?;
 
     assert_eq!(db.get(b"large")?, Some(value.as_slice()));
-    assert_eq!(db.overlay_memory_usage(), b"large".len());
+    assert_eq!(db.stats()?.overlay_memory_bytes, b"large".len());
     let snapshot = db.snapshot()?;
     drop(db);
 
     let mut db = Database::open(&dir)?;
     assert_eq!(db.get(b"large")?, Some(value.as_slice()));
-    assert_eq!(db.overlay_memory_usage(), b"large".len());
+    assert_eq!(db.stats()?.overlay_memory_bytes, b"large".len());
 
     let mut transaction = db.begin_write()?;
     transaction.put(b"large", b"replacement")?;
@@ -357,7 +357,7 @@ fn recovered_values_share_one_overlay_mapping() -> Result<()> {
     assert_eq!(db.get(b"small")?, Some(small.as_slice()));
     assert_eq!(db.get(b"large")?, Some(large.as_slice()));
     assert_eq!(
-        db.overlay_memory_usage(),
+        db.stats()?.overlay_memory_bytes,
         b"small".len() + small.len() + b"large".len()
     );
     drop(db);
@@ -384,7 +384,7 @@ fn put_reserved_stages_exactly_sized_values() -> Result<()> {
         db.get(b"large")?
             .is_some_and(|value| value.iter().all(|byte| *byte == 0xa5))
     );
-    assert_eq!(db.overlay_memory_usage(), b"large".len());
+    assert_eq!(db.stats()?.overlay_memory_bytes, b"large".len());
     drop(db);
 
     let db = Database::open(&dir)?;
@@ -392,7 +392,7 @@ fn put_reserved_stages_exactly_sized_values() -> Result<()> {
         db.get(b"large")?
             .is_some_and(|value| value.iter().all(|byte| *byte == 0xa5))
     );
-    assert_eq!(db.overlay_memory_usage(), b"large".len());
+    assert_eq!(db.stats()?.overlay_memory_bytes, b"large".len());
     drop(db);
     remove_test_database(&dir)?;
     Ok(())

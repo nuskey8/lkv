@@ -94,8 +94,6 @@ lkv_status lkv_database_delete(const lkv_database *database,
                                size_t key_len);
 
 lkv_status lkv_database_len(const lkv_database *database, size_t *output);
-lkv_status lkv_database_overlay_memory_usage(const lkv_database *database,
-                                             size_t *output);
 lkv_status lkv_database_get_stats(const lkv_database *database,
                                   lkv_database_stats *output);
 lkv_status lkv_database_sync(const lkv_database *database);
