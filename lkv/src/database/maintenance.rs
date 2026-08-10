@@ -144,7 +144,7 @@ impl Database {
         }
         failpoints::crash_process_if_requested("after_compact_redundant_superblock_sync");
 
-        // SetEndOfFile fails on Windows while any section of the file is mapped. 
+        // SetEndOfFile fails on Windows while any section of the file is mapped.
         // No snapshot exists, and Overlay mappings were released when the staging Base was installed,
         // so replacing our final Base mapping is sufficient on every supported OS.
         self.state = HandleState::Unavailable;
