@@ -79,6 +79,22 @@ for item in snapshot.iter()? {
 }
 ```
 
+## Compaction
+
+Updates to lkv are appended to the Overlay located behind the Base. As updates and deletions increase, old records remain within the file, and the Overlay index also consumes memory.
+
+`compact()` rebuilds the Base with valid Key/Values, deletes the Overlay and older generations, and physically shrinks the database file.
+
+```rust
+// Ensure no snapshots are referenced during compaction
+drop(snapshot);
+db.compact()?;
+```
+
+Compaction is not performed automatically. If the Overlay exceeds the configured memory limit, new `WriteTransaction`s will return `Error::MaintenanceRequired`.
+
+During compaction, a backup Base is constructed at the end of the same file, so additional disk space is required until completion. In the event of a crash, recovery is possible from the synchronized Base upon reopening, though the file reduction may not be complete. In such cases, `compact()` can be run again.
+
 ## In-Memory
 
 It is also possible to use lkv as an in-memory database.
