@@ -35,7 +35,7 @@ fn memory_storage_shares_base_while_overlay_grows() -> Result<()> {
 }
 
 #[test]
-fn single_file_compact_and_vacuum() -> Result<()> {
+fn compact_rewrites_and_shrinks_the_single_file() -> Result<()> {
     let dir = temp_dir();
     let mut db = Database::open(&dir)?;
     {
@@ -46,6 +46,7 @@ fn single_file_compact_and_vacuum() -> Result<()> {
         txn.commit()?;
     }
     db.compact()?;
+    let first_compacted = fs::metadata(&dir)?.len();
     {
         let mut txn = db.begin_write()?;
         for i in 0..1_000u32 {
@@ -53,11 +54,11 @@ fn single_file_compact_and_vacuum() -> Result<()> {
         }
         txn.commit()?;
     }
-    db.compact()?;
     let before = fs::metadata(&dir)?.len();
-    db.vacuum()?;
+    db.compact()?;
     let after = fs::metadata(&dir)?.len();
     assert!(after < before);
+    assert_eq!(after, first_compacted);
     assert_eq!(db.get(500u32.to_le_bytes())?, Some(&[b'y'; 100][..]));
     assert_eq!(fs::read_dir(dir.parent().unwrap())?.count(), 1);
     drop(db);
@@ -69,20 +70,43 @@ fn single_file_compact_and_vacuum() -> Result<()> {
 }
 
 #[test]
-fn vacuum_requires_snapshots_to_be_dropped() -> Result<()> {
+fn compact_leaves_redundant_superblocks() -> Result<()> {
+    for damaged_offset in [0, SUPERBLOCK_SIZE] {
+        let dir = temp_dir();
+        let mut db = Database::open(&dir)?;
+        db.put(b"key", b"value")?;
+        db.compact()?;
+        drop(db);
+
+        let mut file = OpenOptions::new().read(true).write(true).open(&dir)?;
+        file.seek(SeekFrom::Start(damaged_offset))?;
+        file.write_all(&[0; HEADER_SIZE])?;
+        file.sync_all()?;
+        drop(file);
+
+        let db = Database::open(&dir)?;
+        assert_eq!(db.get(b"key")?, Some(b"value".as_slice()));
+        drop(db);
+        remove_test_database(&dir)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn compact_requires_snapshots_to_be_dropped() -> Result<()> {
     let dir = temp_dir();
     let mut db = Database::open(&dir)?;
     db.put(b"key", b"value")?;
     let snapshot = db.snapshot()?;
 
     let error = db
-        .vacuum()
-        .expect_err("a live snapshot must prevent vacuum");
+        .compact()
+        .expect_err("a live snapshot must prevent compaction");
     assert_eq!(error.kind(), ErrorKind::WouldBlock);
     assert_eq!(db.get(b"key")?, Some(b"value".as_slice()));
 
     drop(snapshot);
-    db.vacuum()?;
+    db.compact()?;
     assert_eq!(db.get(b"key")?, Some(b"value".as_slice()));
     assert!(matches!(&db.base.mapping, BaseBytes::Mapped(_)));
     assert!(!db.storage.is_memory());
@@ -101,7 +125,7 @@ fn mappings_exclude_metadata_and_overlay() -> Result<()> {
     db.put(b"overlay-only", b"new")?;
     assert!(db.storage.len()? > db.base.mapping.len() as u64);
     drop(snapshot);
-    db.vacuum()?;
+    db.compact()?;
 
     assert_eq!(db.get(b"overlay-only")?, Some(b"new".as_slice()));
     drop(db);
@@ -156,69 +180,7 @@ fn stats_describe_active_storage_without_scanning() -> Result<()> {
     assert_eq!(compacted.base_entries, 1);
     assert_eq!(compacted.overlay_entries, 0);
     assert_eq!(compacted.overlay_log_bytes, 0);
-    assert!(compacted.stale_bytes > 0);
-
-    db.vacuum()?;
-    assert_memory_base_is_shared(&db);
-    let vacuumed = db.stats()?;
-    assert_eq!(vacuumed.generation, 3);
-    assert_eq!(vacuumed.base_entries, 1);
-    assert_eq!(vacuumed.overlay_entries, 0);
-    assert_eq!(vacuumed.stale_bytes, 0);
-    assert_eq!(vacuumed.storage_bytes, DATA_START + vacuumed.base_bytes);
-    Ok(())
-}
-
-#[test]
-fn stale_vacuum_file_is_inspected_and_removed_explicitly() -> Result<()> {
-    let dir = temp_dir();
-    let db = Database::open(&dir)?;
-    let temporary = super::super::maintenance::compacting_path(
-        db.path.as_deref().expect("persistent test database"),
-    );
-    fs::write(&temporary, b"partial vacuum")?;
-    assert!(db.has_stale_vacuum()?);
-    assert!(db.remove_stale_vacuum()?);
-    assert!(!db.has_stale_vacuum()?);
-    assert!(!db.remove_stale_vacuum()?);
-
-    let backup = super::super::maintenance::vacuum_backup_path(
-        db.path.as_deref().expect("persistent test database"),
-    );
-    fs::write(&backup, b"old vacuum generation")?;
-    assert!(db.has_stale_vacuum()?);
-    assert!(db.remove_stale_vacuum()?);
-    assert!(!db.has_stale_vacuum()?);
-    drop(db);
-    remove_test_database(&dir)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn vacuum_refuses_a_compacting_symlink_without_touching_its_target() -> Result<()> {
-    use std::os::unix::fs::symlink;
-
-    let dir = temp_dir();
-    let mut db = Database::open(&dir)?;
-    db.put(b"key", b"value")?;
-    let victim = dir.with_file_name("victim");
-    fs::write(&victim, b"must survive")?;
-    symlink(
-        &victim,
-        super::super::maintenance::compacting_path(
-            db.path.as_deref().expect("persistent test database"),
-        ),
-    )?;
-
-    let error = db.vacuum().expect_err("existing symlink must be refused");
-    assert_eq!(error.kind(), ErrorKind::AlreadyExists);
-    assert_eq!(
-        db.remove_stale_vacuum().unwrap_err().kind(),
-        ErrorKind::InvalidInput
-    );
-    assert_eq!(fs::read(&victim)?, b"must survive");
-    drop(db);
-    remove_test_database(&dir)?;
+    assert_eq!(compacted.stale_bytes, 0);
+    assert_eq!(compacted.storage_bytes, DATA_START + compacted.base_bytes);
     Ok(())
 }

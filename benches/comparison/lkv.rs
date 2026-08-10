@@ -24,7 +24,7 @@ fn populated_base() -> (tempfile::TempDir, Database) {
     let dir = temp_dir();
     let mut database = create(&dir.path().join("database.lkv"));
     populate(&mut database);
-    database.vacuum().unwrap();
+    database.compact().unwrap();
     (dir, database)
 }
 
@@ -107,7 +107,7 @@ fn size_uncompacted_compacted(b: &mut Bencher) {
     }
     transaction.commit().unwrap();
     let uncompacted = directory_size(dir.path());
-    database.vacuum().unwrap();
+    database.compact().unwrap();
     let compacted = directory_size(dir.path());
     eprintln!(
         "SIZE lkv uncompacted={:.2}MiB compacted={:.2}MiB",

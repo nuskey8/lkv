@@ -74,6 +74,20 @@ pub fn write(file: &mut (impl Write + Seek), superblock: Superblock) -> Result<(
     Ok(file.write_all(&page)?)
 }
 
+/// Writes the same generation to the other Superblock page.
+///
+/// This is used only after the first copy is durable. A crash while writing
+/// this redundant copy still leaves the first page intact.
+pub(crate) fn write_redundant(
+    file: &mut (impl Write + Seek),
+    superblock: Superblock,
+) -> Result<()> {
+    let page = encode_page(superblock);
+    let offset = ((superblock.generation + 1) & 1) * SUPERBLOCK_SIZE;
+    file.seek(SeekFrom::Start(offset))?;
+    Ok(file.write_all(&page)?)
+}
+
 fn encode_page(superblock: Superblock) -> [u8; SUPERBLOCK_SIZE as usize] {
     let mut page = [0u8; SUPERBLOCK_SIZE as usize];
     page[..8].copy_from_slice(MAGIC);

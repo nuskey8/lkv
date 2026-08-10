@@ -101,7 +101,6 @@ lkv_status lkv_database_get_stats(const lkv_database *database,
 lkv_status lkv_database_sync(const lkv_database *database);
 lkv_status lkv_database_verify(const lkv_database *database);
 lkv_status lkv_database_compact(const lkv_database *database);
-lkv_status lkv_database_vacuum(const lkv_database *database);
 
 lkv_status lkv_database_visit(const lkv_database *database,
                               lkv_visit_fn visitor,

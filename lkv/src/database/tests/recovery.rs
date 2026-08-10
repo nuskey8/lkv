@@ -25,16 +25,9 @@ fn crash_commit_child() -> Result<()> {
         panic!("configured creation crash point was not reached");
     }
     let mut db = Database::open(&path)?;
-    match operation.as_deref() {
-        Ok("compact") => {
-            db.compact()?;
-            panic!("configured compact crash point was not reached");
-        }
-        Ok("vacuum") => {
-            db.vacuum()?;
-            panic!("configured vacuum crash point was not reached");
-        }
-        _ => {}
+    if operation.as_deref() == Ok("compact") {
+        db.compact()?;
+        panic!("configured compact crash point was not reached");
     }
     let mut txn = db.begin_write()?;
     txn.put(b"a", b"new-a")?;
@@ -116,42 +109,38 @@ fn process_crash_never_exposes_a_partial_transaction() -> Result<()> {
 }
 
 #[test]
-fn compact_and_vacuum_crash_points_remain_recoverable() -> Result<()> {
-    for (operation, crash_points) in [
-        (
-            "compact",
-            &["after_compact_base_sync", "after_compact_superblock_sync"][..],
-        ),
-        (
-            "vacuum",
-            &["after_vacuum_file_sync", "after_vacuum_rename"][..],
-        ),
+fn compact_crash_points_remain_recoverable() -> Result<()> {
+    for crash_point in [
+        "after_compact_base_sync",
+        "after_compact_superblock_sync",
+        "after_compact_relocation_sync",
+        "after_compact_destination_superblock_sync",
+        "after_compact_redundant_superblock_sync",
+        "after_compact_truncate_sync",
     ] {
-        for crash_point in crash_points {
-            let dir = temp_dir();
-            {
-                let mut db = Database::open(&dir)?;
-                db.put(b"a", b"value-a")?;
-                db.put(b"b", b"value-b")?;
-            }
-            let status = Command::new(std::env::current_exe()?)
-                .args([
-                    "--exact",
-                    "database::tests::recovery::crash_commit_child",
-                    "--nocapture",
-                ])
-                .env("LKV_TEST_CRASH_DB", &dir)
-                .env("LKV_TEST_CRASH_OPERATION", operation)
-                .env("LKV_TEST_CRASH_POINT", crash_point)
-                .status()?;
-            assert_eq!(status.code(), Some(86));
-
-            let db = Database::open(&dir)?;
-            assert_eq!(db.get(b"a")?, Some(b"value-a".as_slice()));
-            assert_eq!(db.get(b"b")?, Some(b"value-b".as_slice()));
-            drop(db);
-            remove_test_database(&dir)?;
+        let dir = temp_dir();
+        {
+            let mut db = Database::open(&dir)?;
+            db.put(b"a", b"value-a")?;
+            db.put(b"b", b"value-b")?;
         }
+        let status = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "database::tests::recovery::crash_commit_child",
+                "--nocapture",
+            ])
+            .env("LKV_TEST_CRASH_DB", &dir)
+            .env("LKV_TEST_CRASH_OPERATION", "compact")
+            .env("LKV_TEST_CRASH_POINT", crash_point)
+            .status()?;
+        assert_eq!(status.code(), Some(86));
+
+        let db = Database::open(&dir)?;
+        assert_eq!(db.get(b"a")?, Some(b"value-a".as_slice()));
+        assert_eq!(db.get(b"b")?, Some(b"value-b".as_slice()));
+        drop(db);
+        remove_test_database(&dir)?;
     }
     Ok(())
 }
@@ -366,9 +355,6 @@ fn randomized_state_matches_hashmap_across_recovery() -> Result<()> {
         txn.commit()?;
         if chunk % 5 == 0 {
             db.compact()?;
-        }
-        if chunk % 10 == 0 {
-            db.vacuum()?;
         }
         if chunk % 3 == 0 {
             drop(db);
