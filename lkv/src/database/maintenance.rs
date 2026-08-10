@@ -166,6 +166,10 @@ impl Database {
             // section. Install a tiny inaccessible placeholder while every
             // database mapping and both file handles are released.
             let detached = detached_base(self.base.generation)?;
+            FileExt::unlock(&new_file)?;
+            if let Storage::File(file) = &self.storage {
+                FileExt::unlock(file)?;
+            }
             self.state = HandleState::Unavailable;
             self.overlay.clear();
             self.base = detached;
