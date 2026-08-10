@@ -101,6 +101,12 @@ impl Database {
         self.install_superblock(source_superblock)?;
         self.overlay.clear();
 
+        // Prepare the temporary unmapped Base before publishing the relocated Base.
+        // If this allocation fails, both the handle and the durable Superblock still refer to the staging Base,
+        // so later writes remain recoverable after reopening.
+        let destination_generation = source_superblock.generation() + 1;
+        let detached = detached_base(destination_generation)?;
+
         let entries = raw_entries(&self.base, &self.overlay, self.options.verification);
         let destination_written =
             write_base_with_metadata_at(&mut self.storage, DATA_START, live_len, entries)?;
@@ -115,7 +121,7 @@ impl Database {
         failpoints::crash_process_if_requested("after_compact_relocation_sync");
 
         let destination_superblock = Superblock::new(
-            source_superblock.generation() + 1,
+            destination_generation,
             DATA_START,
             destination_written.size,
             destination_written.slots,
@@ -138,11 +144,9 @@ impl Database {
         }
         failpoints::crash_process_if_requested("after_compact_redundant_superblock_sync");
 
-        // SetEndOfFile fails on Windows while any section of the file is
-        // mapped. No snapshot exists, and Overlay mappings were released when
-        // the staging Base was installed, so replacing our final Base mapping
-        // is sufficient on every supported OS.
-        let detached = detached_base(destination_superblock.generation())?;
+        // SetEndOfFile fails on Windows while any section of the file is mapped. 
+        // No snapshot exists, and Overlay mappings were released when the staging Base was installed,
+        // so replacing our final Base mapping is sufficient on every supported OS.
         self.state = HandleState::Unavailable;
         self.base = detached;
         self.storage
