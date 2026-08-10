@@ -35,7 +35,6 @@ fn memory_storage_shares_base_while_overlay_grows() -> Result<()> {
 }
 
 #[test]
-#[cfg(not(windows))]
 fn single_file_compact_and_vacuum() -> Result<()> {
     let dir = temp_dir();
     let mut db = Database::open(&dir)?;
@@ -70,8 +69,30 @@ fn single_file_compact_and_vacuum() -> Result<()> {
 }
 
 #[test]
-#[cfg(not(windows))]
-fn mappings_exclude_metadata_and_overlay_and_snapshot_survives_vacuum() -> Result<()> {
+fn vacuum_requires_snapshots_to_be_dropped() -> Result<()> {
+    let dir = temp_dir();
+    let mut db = Database::open(&dir)?;
+    db.put(b"key", b"value")?;
+    let snapshot = db.snapshot()?;
+
+    let error = db
+        .vacuum()
+        .expect_err("a live snapshot must prevent vacuum");
+    assert_eq!(error.kind(), ErrorKind::WouldBlock);
+    assert_eq!(db.get(b"key")?, Some(b"value".as_slice()));
+
+    drop(snapshot);
+    db.vacuum()?;
+    assert_eq!(db.get(b"key")?, Some(b"value".as_slice()));
+    assert!(matches!(&db.base.mapping, BaseBytes::Mapped(_)));
+    assert!(!db.storage.is_memory());
+    drop(db);
+    remove_test_database(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn mappings_exclude_metadata_and_overlay() -> Result<()> {
     let dir = temp_dir();
     let mut db = Database::open(&dir)?;
     db.put(b"stable", b"old")?;
@@ -79,12 +100,10 @@ fn mappings_exclude_metadata_and_overlay_and_snapshot_survives_vacuum() -> Resul
     let snapshot = db.snapshot()?;
     db.put(b"overlay-only", b"new")?;
     assert!(db.storage.len()? > db.base.mapping.len() as u64);
+    drop(snapshot);
     db.vacuum()?;
 
-    assert_eq!(snapshot.get(b"stable")?, Some(b"old".as_slice()));
-    assert_eq!(snapshot.get(b"overlay-only")?, None);
     assert_eq!(db.get(b"overlay-only")?, Some(b"new".as_slice()));
-    drop(snapshot);
     drop(db);
     remove_test_database(&dir)?;
     Ok(())
@@ -100,6 +119,7 @@ fn failed_published_base_install_poisons_the_handle() -> Result<()> {
         .finish_superblock_install(Err(injected))
         .expect_err("published base install must fail");
     assert_eq!(error.kind(), ErrorKind::Other);
+    assert_eq!(db.len()?, 0);
     assert!(matches!(db.begin_write(), Err(Error::Poisoned)));
 
     drop(db);

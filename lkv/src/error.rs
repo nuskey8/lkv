@@ -54,7 +54,7 @@ pub enum Error {
     /// The active Overlay exceeded its configured memory limit. Compact or
     /// vacuum the database before starting another write transaction.
     MaintenanceRequired { limit: usize, actual: usize },
-    /// A previous write-path I/O failure left this handle unsafe for more writes.
+    /// A previous I/O failure left this handle unsafe for the requested operation.
     Poisoned,
     /// An underlying filesystem operation failed.
     Io(io::Error),
@@ -143,7 +143,7 @@ impl fmt::Display for Error {
                 "overlay memory usage of {actual} bytes exceeds the {limit} byte limit; compact or vacuum before writing"
             ),
             Self::Poisoned => formatter.write_str(
-                "database is poisoned by a previous I/O failure; reopen it before writing",
+                "database is poisoned by a previous I/O failure; reopen it before continuing",
             ),
         }
     }

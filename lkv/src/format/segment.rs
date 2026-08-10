@@ -62,6 +62,14 @@ pub fn record_at(mapping: &[u8], offset: usize, data_size: usize) -> Result<(&[u
 
 struct WrittenSegment {
     pub size: u64,
+    pub metadata_checksum: u32,
+}
+
+pub(crate) struct WrittenBase {
+    pub size: u64,
+    pub slots: u64,
+    pub len: usize,
+    pub metadata_checksum: u32,
 }
 
 pub fn map(file: &File, offset: u64, size: u64) -> Result<Arc<Mmap>> {
@@ -110,6 +118,15 @@ pub fn write_base_at<'a, S: Read + Write + Seek>(
     len: usize,
     entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
 ) -> Result<u64> {
+    Ok(write_base_with_metadata_at(file, start, len, entries)?.size)
+}
+
+pub(crate) fn write_base_with_metadata_at<'a, S: Read + Write + Seek>(
+    file: &mut S,
+    start: u64,
+    len: usize,
+    entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+) -> Result<WrittenBase> {
     let slots = base_slot_count(len)?;
     let mut index = vec![(0u32, 0u64); slots as usize];
     let index_bytes = (slots as usize)
@@ -162,7 +179,13 @@ pub fn write_base_at<'a, S: Read + Write + Seek>(
     }
     writer.flush()?;
     drop(writer);
-    Ok(append_block_checksums(file, start, offset - start)?.size)
+    let written = append_block_checksums(file, start, offset - start)?;
+    Ok(WrittenBase {
+        size: written.size,
+        slots,
+        len,
+        metadata_checksum: written.metadata_checksum,
+    })
 }
 
 fn append_block_checksums(
@@ -183,12 +206,16 @@ fn append_block_checksums(
     }
 
     let metadata = checksum_metadata(data_size, &checksums)?;
+    let metadata_checksum = crc32c(&metadata);
     file.seek(SeekFrom::Start(start + data_size))?;
     file.write_all(&metadata)?;
     let size = data_size
         .checked_add(metadata.len() as u64)
         .ok_or_else(|| Error::from_io(ErrorKind::InvalidInput, "segment is too large"))?;
-    Ok(WrittenSegment { size })
+    Ok(WrittenSegment {
+        size,
+        metadata_checksum,
+    })
 }
 
 fn checksum_metadata(data_size: u64, checksums: &[u32]) -> Result<Vec<u8>> {

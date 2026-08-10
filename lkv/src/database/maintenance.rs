@@ -1,15 +1,22 @@
 //! Logical compaction, physical vacuuming, and stale-vacuum handling.
 
-use super::state::{ActiveBase, BaseBytes};
+use super::state::{ActiveBase, BaseBytes, OverlayState};
 use super::storage::Storage;
-use super::{Database, failpoints, sync_directory};
+use super::transaction::RawEntries;
+use super::view::{BaseView, ReadView};
+use super::{Database, HandleState, failpoints, sync_directory};
+#[cfg(windows)]
+use super::{load_storage_state, open_database_file};
 use crate::error::{Error, Result};
 use crate::format::log::{LOG_HEADER_SIZE, write_compact_marker};
+#[cfg(windows)]
+use crate::format::segment::EMPTY_SEGMENT_SIZE;
 use crate::format::segment::{
-    self, measure_base_iter, read_base_header, segment_layout, segment_metadata_checksum,
-    write_base_at,
+    measure_base_iter, read_base_header, segment_layout, segment_metadata_checksum, write_base_at,
+    write_base_with_metadata_at,
 };
 use crate::format::superblock::{self, DATA_START, Superblock};
+use crate::options::VerificationMode;
 use fs2::FileExt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
@@ -29,14 +36,13 @@ impl Database {
             .checked_add(expected_base_size)
             .ok_or_else(|| Error::from_io(ErrorKind::InvalidInput, "compact size overflow"))?;
         self.ensure_capacity(additional)?;
-        let path = self.path.as_ref().expect("file storage has a path");
-        let mut writer = OpenOptions::new().read(true).write(true).open(path)?;
-        let rollback_offset = writer.seek(SeekFrom::End(0))?;
-        if let Err(error) = write_compact_marker(&mut writer) {
+        let rollback_offset = self.storage.seek(SeekFrom::End(0))?;
+        if let Err(error) = write_compact_marker(&mut self.storage) {
             return self.rollback_or_poison(rollback_offset, error);
         }
-        let base_offset = writer.stream_position()?;
-        let base_size = match write_base_at(&mut writer, base_offset, live_len, self.iter_raw()) {
+        let base_offset = self.storage.stream_position()?;
+        let entries = raw_entries(&self.base, &self.overlay, self.options.verification);
+        let base_size = match write_base_at(&mut self.storage, base_offset, live_len, entries) {
             Ok(size) => size,
             Err(error) => return self.rollback_or_poison(rollback_offset, error),
         };
@@ -46,11 +52,10 @@ impl Database {
                 Error::other("base size changed while compacting"),
             );
         }
-        if let Err(error) = writer.sync_data() {
-            return self.rollback_or_poison(rollback_offset, error.into());
+        if let Err(error) = self.storage.sync_data() {
+            return self.rollback_or_poison(rollback_offset, error);
         }
         failpoints::crash_process_if_requested("after_compact_base_sync");
-        drop(writer);
         let mapping = self.storage.load_immutable(base_offset, base_size)?;
         let segment = &mapping[..];
         let (base_slots, base_len) = read_base_header(segment_layout(segment)?.data())?;
@@ -68,7 +73,7 @@ impl Database {
         if let Err(error) =
             superblock::write(&mut self.storage, superblock).and_then(|()| self.storage.sync_all())
         {
-            self.poisoned = true;
+            self.state = HandleState::WritePoisoned;
             return Err(error);
         }
         failpoints::crash_process_if_requested("after_compact_superblock_sync");
@@ -96,15 +101,21 @@ impl Database {
     }
 
     /// Rebuilds only live entries and atomically replaces the storage image.
-    /// Unlike [`Database::compact`], this physically shrinks it. File databases
-    /// return [`Error::Unsupported`] on Windows; memory databases are supported.
+    /// Unlike [`Database::compact`], this physically shrinks it.
+    ///
+    /// All snapshots must be dropped before this operation.
     pub fn vacuum(&mut self) -> Result<()> {
         self.ensure_writable()?;
         self.verify()?;
+        if Arc::strong_count(&self.snapshot_guard) != 1 {
+            return Err(Error::from_io(
+                ErrorKind::WouldBlock,
+                "vacuum requires all snapshots to be dropped",
+            ));
+        }
         if self.storage.is_memory() {
             return self.vacuum_memory();
         }
-        ensure_vacuum_supported()?;
         let (live_len, expected_base_size) = measure_base_iter(self.iter_raw())?;
         self.vacuum_precomputed(live_len, expected_base_size)
     }
@@ -128,36 +139,62 @@ impl Database {
             .open(&temporary)?;
         FileExt::try_lock_exclusive(&new_file)?;
         new_file.set_len(DATA_START)?;
-        let base_size = write_base_at(&mut new_file, DATA_START, live_len, self.iter_raw())?;
-        if base_size != expected_base_size {
+        let written =
+            write_base_with_metadata_at(&mut new_file, DATA_START, live_len, self.iter_raw())?;
+        if written.size != expected_base_size {
             return Err(Error::other("base size changed while vacuuming"));
         }
-        let mapping = segment::map(&new_file, DATA_START, base_size)?;
-        let segment = &mapping[..];
-        let (base_slots, base_len) = read_base_header(segment_layout(segment)?.data())?;
-        let base_checksum = segment_metadata_checksum(segment)?;
-        drop(mapping);
         let superblock = Superblock::new(
             self.base.generation + 1,
             DATA_START,
-            base_size,
-            base_slots,
-            base_len as u64,
-            DATA_START + base_size,
-            base_checksum,
+            written.size,
+            written.slots,
+            written.len as u64,
+            DATA_START + written.size,
+            written.metadata_checksum,
         );
         superblock::write(&mut new_file, superblock)?;
         new_file.sync_all()?;
         failpoints::crash_process_if_requested("after_vacuum_file_sync");
+
+        #[cfg(not(windows))]
         fs::rename(&temporary, &path)?;
+
+        #[cfg(windows)]
+        {
+            // Windows refuses replacement while either file has an open mapped
+            // section. Install a tiny inaccessible placeholder while every
+            // database mapping and both file handles are released.
+            let detached = detached_base(self.base.generation)?;
+            self.state = HandleState::Unavailable;
+            self.overlay.clear();
+            self.base = detached;
+            let old_storage = std::mem::replace(&mut self.storage, Storage::memory());
+            drop(old_storage);
+            drop(new_file);
+            if let Err(error) = fs::rename(&temporary, &path) {
+                let _ = self.restore_windows_database(&path);
+                return Err(error.into());
+            }
+        }
+
         failpoints::crash_process_if_requested("after_vacuum_rename");
-        self.storage = Storage::File(new_file);
-        self.install_superblock(superblock)?;
-        self.overlay.clear();
+
+        #[cfg(not(windows))]
+        {
+            self.storage = Storage::File(new_file);
+            self.install_superblock(superblock)?;
+            self.overlay.clear();
+        }
+
+        #[cfg(windows)]
+        {
+            self.install_windows_vacuum(&path, superblock)?;
+        }
         if let Some(parent) = path.parent()
             && let Err(error) = sync_directory(parent)
         {
-            self.poisoned = true;
+            self.state = HandleState::WritePoisoned;
             return Err(error);
         }
         Ok(())
@@ -180,6 +217,32 @@ impl Database {
             return Err(Error::other("base size changed while vacuuming"));
         }
         self.install_memory_base(DATA_START, bytes, live_len)
+    }
+
+    #[cfg(windows)]
+    fn install_windows_vacuum(&mut self, path: &Path, superblock: Superblock) -> Result<()> {
+        let file = open_database_file(path)?;
+        let mut storage = Storage::File(file);
+        let mapping = storage.load_immutable(superblock.base_offset(), superblock.base_size())?;
+        let base = ActiveBase::install(mapping, superblock)?;
+        storage.seek(SeekFrom::End(0))?;
+        self.storage = storage;
+        self.base = base;
+        self.overlay.clear();
+        self.state = HandleState::Healthy;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn restore_windows_database(&mut self, path: &Path) -> Result<()> {
+        let file = open_database_file(path)?;
+        let mut storage = Storage::File(file);
+        let (base, overlay) = load_storage_state(&mut storage, &self.options)?;
+        self.storage = storage;
+        self.base = base;
+        self.overlay = overlay;
+        self.state = HandleState::Healthy;
+        Ok(())
     }
 
     fn install_memory_base(
@@ -213,11 +276,11 @@ impl Database {
         if let Err(error) =
             superblock::write(&mut self.storage, superblock).and_then(|()| self.storage.sync_all())
         {
-            self.poisoned = true;
+            self.state = HandleState::WritePoisoned;
             return Err(error);
         }
         if let Err(error) = self.storage.replace_memory_base(base_offset, bytes) {
-            self.poisoned = true;
+            self.state = HandleState::WritePoisoned;
             return Err(error);
         }
         self.finish_superblock_install(Ok(installed))?;
@@ -282,6 +345,48 @@ impl Database {
         }
         Ok(true)
     }
+}
+
+#[cfg(windows)]
+fn detached_base(generation: u64) -> Result<ActiveBase> {
+    let bytes = build_memory_base(DATA_START, EMPTY_SEGMENT_SIZE, 0, std::iter::empty())?;
+    let mapping = BaseBytes::Memory {
+        range: 0..bytes.len(),
+        bytes,
+    };
+    let checksum = segment_metadata_checksum(&mapping)?;
+    ActiveBase::install(
+        mapping,
+        Superblock::new(
+            generation,
+            DATA_START,
+            EMPTY_SEGMENT_SIZE,
+            0,
+            0,
+            DATA_START + EMPTY_SEGMENT_SIZE,
+            checksum,
+        ),
+    )
+}
+
+fn raw_entries<'a>(
+    base: &'a ActiveBase,
+    overlay: &'a OverlayState,
+    verification: VerificationMode,
+) -> RawEntries<'a> {
+    RawEntries::new(
+        ReadView {
+            base: BaseView {
+                mapping: &base.mapping,
+                verifier: &base.verifier,
+                offset: base.offset,
+                slots: base.slots,
+            },
+            overlay: &overlay.index,
+            verification,
+        },
+        base.len,
+    )
 }
 
 fn build_memory_base<'a>(
@@ -365,19 +470,6 @@ impl Seek for OffsetBuffer {
         let relative = self.inner.seek(SeekFrom::Start(relative))?;
         self.absolute(relative)
     }
-}
-
-#[cfg(not(windows))]
-fn ensure_vacuum_supported() -> Result<()> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn ensure_vacuum_supported() -> Result<()> {
-    Err(Error::from_io(
-        ErrorKind::Unsupported,
-        "vacuum is not supported on Windows",
-    ))
 }
 
 pub fn compacting_path(path: &Path) -> PathBuf {

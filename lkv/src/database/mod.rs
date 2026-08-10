@@ -66,6 +66,13 @@ pub struct DatabaseStats {
     pub generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandleState {
+    Healthy,
+    WritePoisoned,
+    Unavailable,
+}
+
 /// Represents an open lkv database.
 ///
 /// ## Examples
@@ -93,7 +100,8 @@ pub struct Database {
     base: ActiveBase,
     overlay: OverlayState,
     options: DatabaseOptions,
-    poisoned: bool,
+    snapshot_guard: Arc<()>,
+    state: HandleState,
 }
 
 impl Drop for Database {
@@ -192,43 +200,28 @@ impl Database {
                 storage_len,
             ));
         }
-        let superblock = superblock::read_latest_from(&mut storage, storage_len)?;
-        let mapping = storage.load_immutable(superblock.base_offset(), superblock.base_size())?;
-        let base = ActiveBase::open(mapping, superblock, options.verification)?;
-        let overlay_scan = scan_overlay(&mut storage, base.log_start, storage_len)?;
-        let valid_len = overlay_scan.valid_len();
-        if valid_len < storage_len {
-            storage.set_len(valid_len)?;
-            storage.sync_data()?;
-        }
-        let overlay_size = valid_len
-            .checked_sub(base.log_start)
-            .ok_or_else(|| Error::invalid_base("overlay range precedes active Base"))?;
-        let overlay_mapping = if overlay_size == 0 {
-            None
-        } else {
-            Some(storage.load_immutable(base.log_start, overlay_size)?)
-        };
-        let overlay_index = overlay_scan.into_index(overlay_mapping, base.log_start)?;
-        storage.seek(SeekFrom::End(0))?;
+        let (base, overlay) = load_storage_state(&mut storage, &options)?;
 
         Ok(Self {
             path,
             storage,
             base,
-            overlay: OverlayState::new(overlay_index),
+            overlay,
             options,
-            poisoned: false,
+            snapshot_guard: Arc::new(()),
+            state: HandleState::Healthy,
         })
     }
 
     /// Performs the complete integrity verification used by a Full open.
     pub fn verify(&self) -> Result<()> {
+        self.ensure_available()?;
         self.base.verify()
     }
 
     /// Begins a read transaction.
     pub fn begin_read(&self) -> Result<ReadTransaction<'_>> {
+        self.ensure_available()?;
         Ok(ReadTransaction::new(self))
     }
 
@@ -253,14 +246,14 @@ impl Database {
     /// # }
     /// ```
     pub fn snapshot(&self) -> Result<Snapshot> {
+        self.ensure_available()?;
         Ok(Snapshot::new(
             self.base.mapping.clone(),
             self.options.verification,
             Arc::clone(&self.base.verifier),
             Arc::clone(&self.overlay.index),
-            self.base.offset,
-            self.base.slots,
-            self.base.len,
+            (self.base.offset, self.base.slots, self.base.len),
+            Arc::clone(&self.snapshot_guard),
         ))
     }
 
@@ -278,6 +271,7 @@ impl Database {
 
     /// Returns the value for the given key.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<&[u8]>> {
+        self.ensure_available()?;
         self.read_view().get(key.as_ref())
     }
 
@@ -372,6 +366,7 @@ impl Database {
 
     /// Iterates over all live entries without copying keys or values.
     pub fn iter(&self) -> Result<Entries<'_>> {
+        self.ensure_available()?;
         Ok(Entries::new(self.read_view(), self.base.len))
     }
 
@@ -381,6 +376,7 @@ impl Database {
 
     /// Returns the number of live entries in the database.
     pub fn len(&self) -> Result<usize> {
+        self.ensure_available()?;
         self.raw_len()
     }
 
@@ -391,6 +387,7 @@ impl Database {
 
     /// Returns the database statistics.
     pub fn stats(&self) -> Result<DatabaseStats> {
+        self.ensure_available()?;
         let storage_bytes = self.storage.len()?;
         Ok(DatabaseStats {
             storage_bytes,
@@ -416,6 +413,7 @@ impl Database {
 
     /// Flushes overlay contents and metadata for a file database.
     pub fn sync(&self) -> Result<()> {
+        self.ensure_available()?;
         self.storage.sync_data()
     }
 
@@ -431,12 +429,12 @@ impl Database {
         let base = match installed {
             Ok(base) => base,
             Err(error) => {
-                self.poisoned = true;
+                self.state = HandleState::WritePoisoned;
                 return Err(error);
             }
         };
         if let Err(error) = self.storage.seek(SeekFrom::End(0)) {
-            self.poisoned = true;
+            self.state = HandleState::WritePoisoned;
             return Err(error.into());
         }
         self.base = base;
@@ -444,7 +442,15 @@ impl Database {
     }
 
     fn ensure_writable(&self) -> Result<()> {
-        if self.poisoned {
+        if self.state != HandleState::Healthy {
+            Err(Error::Poisoned)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_available(&self) -> Result<()> {
+        if self.state == HandleState::Unavailable {
             Err(Error::Poisoned)
         } else {
             Ok(())
@@ -482,13 +488,46 @@ impl Database {
     }
 
     fn rollback_or_poison<T>(&mut self, offset: u64, error: Error) -> Result<T> {
-        self.poisoned = true;
+        self.state = HandleState::WritePoisoned;
         if self.storage.set_len(offset).is_ok() {
             let _ = self.storage.sync_data();
         }
         let _ = self.storage.seek(SeekFrom::End(0));
         Err(error)
     }
+}
+
+fn load_storage_state(
+    storage: &mut Storage,
+    options: &DatabaseOptions,
+) -> Result<(ActiveBase, OverlayState)> {
+    let storage_len = storage.len()?;
+    let superblock = superblock::read_latest_from(storage, storage_len)?;
+    let mapping = storage.load_immutable(superblock.base_offset(), superblock.base_size())?;
+    let mut base = ActiveBase::open(mapping, superblock, options.verification)?;
+    let overlay_scan = scan_overlay(storage, base.log_start, storage_len)?;
+    let valid_len = overlay_scan.valid_len();
+    if valid_len < storage_len {
+        // SetEndOfFile fails on Windows while any section of the file is mapped.
+        // Validate first, then temporarily release our Base mapping
+        // before discarding an incomplete Overlay tail.
+        drop(base);
+        storage.set_len(valid_len)?;
+        storage.sync_data()?;
+        let mapping = storage.load_immutable(superblock.base_offset(), superblock.base_size())?;
+        base = ActiveBase::open(mapping, superblock, options.verification)?;
+    }
+    let overlay_size = valid_len
+        .checked_sub(base.log_start)
+        .ok_or_else(|| Error::invalid_base("overlay range precedes active Base"))?;
+    let overlay_mapping = if overlay_size == 0 {
+        None
+    } else {
+        Some(storage.load_immutable(base.log_start, overlay_size)?)
+    };
+    let overlay_index = overlay_scan.into_index(overlay_mapping, base.log_start)?;
+    storage.seek(SeekFrom::End(0))?;
+    Ok((base, OverlayState::new(overlay_index)))
 }
 
 fn committed_entries(
