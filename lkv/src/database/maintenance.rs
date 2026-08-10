@@ -20,12 +20,18 @@ impl Database {
     /// All snapshots must be dropped before this operation.
     pub fn compact(&mut self) -> Result<()> {
         self.ensure_writable()?;
-        self.verify()?;
         if Arc::strong_count(&self.snapshot_guard) != 1 {
             return Err(Error::from_io(
                 ErrorKind::WouldBlock,
                 "compact requires all snapshots to be dropped",
             ));
+        }
+        self.verify()?;
+        if self.base.offset == DATA_START
+            && self.overlay.index.is_empty()
+            && self.storage.len()? == self.base.log_start
+        {
+            return Ok(());
         }
         let (live_len, expected_base_size) = measure_base_iter(self.iter_raw())?;
         if self.storage.is_memory() {

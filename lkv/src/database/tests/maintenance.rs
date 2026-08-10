@@ -116,6 +116,45 @@ fn compact_requires_snapshots_to_be_dropped() -> Result<()> {
 }
 
 #[test]
+fn compact_rejects_snapshots_before_verifying_the_base() -> Result<()> {
+    let dir = temp_dir();
+    let mut db = Database::open(&dir)?;
+    let snapshot = db.snapshot()?;
+    let checksum = db.base.checksum;
+    db.base.checksum ^= 1;
+
+    let error = db
+        .compact()
+        .expect_err("a live snapshot must be rejected before verification");
+    assert_eq!(error.kind(), ErrorKind::WouldBlock);
+
+    db.base.checksum = checksum;
+    drop(snapshot);
+    drop(db);
+    remove_test_database(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn compact_is_a_no_op_for_an_already_compact_database() -> Result<()> {
+    let dir = temp_dir();
+    let mut db = Database::open(&dir)?;
+    db.put(b"key", b"value")?;
+    db.compact()?;
+    let generation = db.base.generation;
+    let storage_len = db.storage.len()?;
+
+    db.compact()?;
+
+    assert_eq!(db.base.generation, generation);
+    assert_eq!(db.storage.len()?, storage_len);
+    assert_eq!(db.get(b"key")?, Some(b"value".as_slice()));
+    drop(db);
+    remove_test_database(&dir)?;
+    Ok(())
+}
+
+#[test]
 fn mappings_exclude_metadata_and_overlay() -> Result<()> {
     let dir = temp_dir();
     let mut db = Database::open(&dir)?;
