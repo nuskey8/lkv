@@ -251,8 +251,6 @@ fn memory_database_supports_transactions_snapshots_and_maintenance() -> Result<(
     assert_eq!(db.get(b"key")?, Some(b"new".as_slice()));
     assert_eq!(db.get(b"gone")?, None);
     db.sync()?;
-    db.compact()?;
-    assert_eq!(db.overlay_memory_usage(), 0);
     assert_eq!(snapshot.get(b"key")?, Some(b"old".as_slice()));
     let entries = snapshot
         .iter()?
@@ -262,17 +260,16 @@ fn memory_database_supports_transactions_snapshots_and_maintenance() -> Result<(
     assert_eq!(entries.get(b"gone".as_slice()), Some(&b"value".to_vec()));
     assert_eq!(snapshot.len()?, 2);
     assert_eq!(
-        db.vacuum()
+        db.compact()
             .expect_err("a memory database must enforce the same snapshot rule")
             .kind(),
         ErrorKind::WouldBlock
     );
     drop(snapshot);
-    db.vacuum()?;
+    db.compact()?;
+    assert_eq!(db.overlay_memory_usage(), 0);
     db.verify()?;
     assert_eq!(db.get(b"other")?, Some(b"two".as_slice()));
-    assert!(!db.has_stale_vacuum()?);
-    assert!(!db.remove_stale_vacuum()?);
     drop(db);
     Ok(())
 }
@@ -331,7 +328,7 @@ fn large_values_are_transparently_mapped_and_survive_recovery() -> Result<()> {
     assert_eq!(db.get(b"large")?, Some(b"replacement".as_slice()));
     assert_eq!(snapshot.get(b"large")?, Some(value.as_slice()));
     drop(snapshot);
-    db.vacuum()?;
+    db.compact()?;
     assert_eq!(db.get(b"large")?, Some(b"replacement".as_slice()));
     drop(db);
     remove_test_database(&dir)?;

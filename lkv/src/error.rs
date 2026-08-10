@@ -51,8 +51,8 @@ pub enum Error {
     InvalidArgument(io::Error),
     /// The configured maximum database size would be exceeded.
     DatabaseFull(io::Error),
-    /// The active Overlay exceeded its configured memory limit. Compact or
-    /// vacuum the database before starting another write transaction.
+    /// The active Overlay exceeded its configured memory limit. Compact the
+    /// database before starting another write transaction.
     MaintenanceRequired { limit: usize, actual: usize },
     /// A previous I/O failure left this handle unsafe for the requested operation.
     Poisoned,
@@ -140,7 +140,7 @@ impl fmt::Display for Error {
             | Self::Io(error) => error.fmt(formatter),
             Self::MaintenanceRequired { limit, actual } => write!(
                 formatter,
-                "overlay memory usage of {actual} bytes exceeds the {limit} byte limit; compact or vacuum before writing"
+                "overlay memory usage of {actual} bytes exceeds the {limit} byte limit; compact before writing"
             ),
             Self::Poisoned => formatter.write_str(
                 "database is poisoned by a previous I/O failure; reopen it before continuing",

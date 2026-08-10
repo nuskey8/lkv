@@ -65,7 +65,7 @@ fn reopen_compacted_200k(b: &mut Bencher) {
     let path = directory.path().join("database.lkv");
     let mut database = create(&path);
     put_small_entries(&mut database, SMALL_KEYS, 0);
-    database.vacuum().unwrap();
+    database.compact().unwrap();
     drop(database);
     bench_reopen(b, &path);
 }

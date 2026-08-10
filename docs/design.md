@@ -17,18 +17,18 @@ The first 8 KiB are reserved for two Superblocks. All Base and Overlay data foll
 ```
 
 A generation consists of one immutable Base followed by zero or more Overlay records.
-Rebuilding the Base appends a new generation instead of overwriting the current one.
+Compaction temporarily appends a new generation before relocating it to the start of the data area.
 
 ```text
 older --------------------------------------------------------------> newer
 
-Base 0 | Overlay 0 | compact marker | Base 1 | Overlay 1 | ...
+Base 0 | Overlay 0 | compact marker | staging Base
   ^                                      ^
-  +-- old Superblock                     +-- active Superblock
+  +-- old Superblock                     +-- staging Superblock
 ```
 
 Only the generation selected by the active Superblock is visible.
-Older bytes are inert and can be removed by rewriting the image.
+Older bytes are inert. A completed compaction leaves one Base at offset 8192 and truncates everything after it.
 
 This append-first layout keeps published data immutable. 
 A new generation becomes visible through one small metadata switch after its Base has reached stable storage.
@@ -186,17 +186,24 @@ A batch is appended and synchronized before it is considered visible.
 An incomplete final header or payload is an interrupted append and may be discarded. 
 A complete record with an invalid checksum or structure is corruption and is not silently repaired.
 
-A new Base is published in this order:
+A compacted Base is published in this order:
 
 ```text
-append compact marker and new Base
-synchronize the new Base
-write the alternate Superblock with generation + 1
-synchronize the Superblock
+append compact marker and a staging Base
+synchronize and publish the staging Base
+rebuild the Base at offset 8192
+append a compact marker after the relocated Base
+synchronize the relocated Base and marker
+publish the relocated Base in both Superblock pages
+release the old mapping and truncate after the relocated Base
+synchronize and remap the compacted image
 ```
 
-Before the Superblock switch, the old generation is authoritative. After it, the new generation is authoritative. 
-This provides atomic generation replacement without an in-place page-update or WAL protocol.
+Before the first Superblock switch, the old generation is authoritative. The staging generation remains
+authoritative while the front of the file is rewritten. The final marker prevents recovery from interpreting
+untruncated staging bytes as Overlay records if compaction stops after the relocated Base is published.
 
-The cost is retained history: rebuilding the Base does not reclaim old generations.
-Physical space is recovered only by constructing a fresh image containing the two Superblock pages and one live Base.
+Every published transition points to a complete synchronized Base. After success, the file contains only the two
+Superblock pages and one live Base. Compaction uses no sidecar file, but temporarily grows the database to hold a
+staging Base and writes the live data twice. Snapshots must be dropped before compaction so the old mapping can be
+released before truncation.

@@ -95,7 +95,6 @@ enum HandleState {
 /// ```
 ///
 pub struct Database {
-    path: Option<PathBuf>,
     storage: Storage,
     base: ActiveBase,
     overlay: OverlayState,
@@ -146,7 +145,7 @@ impl Database {
                 initial_len,
             ));
         }
-        Self::from_storage(Some(path), Storage::File(file), options)
+        Self::from_storage(Storage::File(file), options)
     }
 
     /// Creates and opens a new empty database.
@@ -172,7 +171,7 @@ impl Database {
             Err(error) => return Err(error.into()),
         }
         let file = create_database_file(&path)?;
-        Self::from_storage(Some(path), Storage::File(file), options)
+        Self::from_storage(Storage::File(file), options)
     }
 
     /// Creates a new database in memory.
@@ -185,14 +184,10 @@ impl Database {
         validate_options(&options)?;
         let mut storage = Storage::memory();
         initialize_storage(&mut storage)?;
-        Self::from_storage(None, storage, options)
+        Self::from_storage(storage, options)
     }
 
-    fn from_storage(
-        path: Option<PathBuf>,
-        mut storage: Storage,
-        options: DatabaseOptions,
-    ) -> Result<Self> {
+    fn from_storage(mut storage: Storage, options: DatabaseOptions) -> Result<Self> {
         let storage_len = storage.len()?;
         if storage_len > options.max_database_bytes {
             return Err(Error::database_full(
@@ -203,7 +198,6 @@ impl Database {
         let (base, overlay) = load_storage_state(&mut storage, &options)?;
 
         Ok(Self {
-            path,
             storage,
             base,
             overlay,

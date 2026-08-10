@@ -572,16 +572,6 @@ pub unsafe extern "C" fn lkv_database_compact(database: *const lkv_database) -> 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn lkv_database_vacuum(database: *const lkv_database) -> lkv_status {
-    ffi_call(|| {
-        // SAFETY: pointer is checked before use.
-        let database = unsafe { required_ref(database, "database")? };
-        write_database(database)?.vacuum()?;
-        Ok(())
-    })
-}
-
-#[unsafe(no_mangle)]
 pub unsafe extern "C" fn lkv_snapshot_create(
     database: *const lkv_database,
     output: *mut *mut lkv_snapshot,
@@ -931,14 +921,14 @@ mod tests {
                 LKV_OK
             );
             assert_eq!(slice::from_raw_parts(old, old_len), b"old");
+            assert_eq!(lkv_database_compact(database), LKV_BUSY);
+            assert_eq!(slice::from_raw_parts(old, old_len), b"old");
+            assert_eq!(lkv_snapshot_close(snapshot), LKV_OK);
             assert_eq!(lkv_database_compact(database), LKV_OK);
             assert_eq!(lkv_database_get_stats(database, &mut stats), LKV_OK);
             assert_eq!(stats.base_entries, 2);
             assert_eq!(stats.overlay_entries, 0);
-            assert_eq!(slice::from_raw_parts(old, old_len), b"old");
-            assert_eq!(lkv_database_vacuum(database), LKV_BUSY);
-            assert_eq!(lkv_snapshot_close(snapshot), LKV_OK);
-            assert_eq!(lkv_database_vacuum(database), LKV_OK);
+            assert_eq!(stats.stale_bytes, 0);
             assert_eq!(lkv_database_verify(database), LKV_OK);
 
             assert_eq!(lkv_write_batch_close(batch), LKV_OK);
@@ -1015,7 +1005,6 @@ mod tests {
             );
             assert_eq!(lkv_database_sync(database), LKV_OK);
             assert_eq!(lkv_database_compact(database), LKV_OK);
-            assert_eq!(lkv_database_vacuum(database), LKV_OK);
             let mut value = ptr::null();
             let mut len = 0;
             assert_eq!(
