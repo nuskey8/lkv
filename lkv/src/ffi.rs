@@ -935,15 +935,13 @@ mod tests {
             assert_eq!(lkv_database_get_stats(database, &mut stats), LKV_OK);
             assert_eq!(stats.base_entries, 2);
             assert_eq!(stats.overlay_entries, 0);
-            #[cfg(not(windows))]
-            assert_eq!(lkv_database_vacuum(database), LKV_OK);
-            #[cfg(windows)]
-            assert_eq!(lkv_database_vacuum(database), LKV_UNSUPPORTED);
-            assert_eq!(lkv_database_verify(database), LKV_OK);
             assert_eq!(slice::from_raw_parts(old, old_len), b"old");
+            assert_eq!(lkv_database_vacuum(database), LKV_BUSY);
+            assert_eq!(lkv_snapshot_close(snapshot), LKV_OK);
+            assert_eq!(lkv_database_vacuum(database), LKV_OK);
+            assert_eq!(lkv_database_verify(database), LKV_OK);
 
             assert_eq!(lkv_write_batch_close(batch), LKV_OK);
-            assert_eq!(lkv_snapshot_close(snapshot), LKV_OK);
             assert_eq!(lkv_database_close(database), LKV_OK);
             remove_database(&path);
         }

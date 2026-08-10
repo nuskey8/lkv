@@ -13,6 +13,7 @@ fn rejects_corrupt_base_lengths() -> Result<()> {
     file.seek(SeekFrom::Start(record_offset + 4))?;
     file.write_all(&u32::MAX.to_le_bytes())?;
     file.sync_all()?;
+    drop(file);
     let error = Database::open_with_options(
         &dir,
         DatabaseOptions {
@@ -96,6 +97,7 @@ fn rejects_base_value_corruption() -> Result<()> {
     file.seek(SeekFrom::Start(value_offset))?;
     file.write_all(&byte)?;
     file.sync_all()?;
+    drop(file);
     let db = Database::open(&dir)?;
     let error = db
         .get(b"key")
@@ -155,6 +157,7 @@ fn on_read_open_still_rejects_checksum_metadata_corruption() -> Result<()> {
     file.seek(SeekFrom::Start(checksum_table_offset))?;
     file.write_all(&0u32.to_le_bytes())?;
     file.sync_all()?;
+    drop(file);
     let error = Database::open(&dir)
         .err()
         .expect("checksum table metadata must be protected");

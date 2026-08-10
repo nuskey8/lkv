@@ -438,6 +438,7 @@ pub struct Snapshot {
     base_offset: u64,
     base_slots: u64,
     base_len: usize,
+    _database_snapshot: Arc<()>,
 }
 
 impl Snapshot {
@@ -446,10 +447,10 @@ impl Snapshot {
         verification: VerificationMode,
         base_verifier: Arc<SegmentVerifier>,
         overlay_index: Arc<KeyMap<OverlayEntry>>,
-        base_offset: u64,
-        base_slots: u64,
-        base_len: usize,
+        base_metadata: (u64, u64, usize),
+        database_snapshot: Arc<()>,
     ) -> Self {
+        let (base_offset, base_slots, base_len) = base_metadata;
         Self {
             base,
             verification,
@@ -458,6 +459,7 @@ impl Snapshot {
             base_offset,
             base_slots,
             base_len,
+            _database_snapshot: database_snapshot,
         }
     }
 

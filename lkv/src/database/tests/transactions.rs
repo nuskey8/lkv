@@ -32,6 +32,7 @@ fn write_read_delete_reopen_and_compact() -> Result<()> {
     let db = Database::open(&dir)?;
     assert_eq!(db.get(b"one")?, Some(b"updated".as_slice()));
     assert_eq!(db.get(b"three")?, Some(b"3".as_slice()));
+    drop(db);
     remove_test_database(&dir)?;
     Ok(())
 }
@@ -253,13 +254,6 @@ fn memory_database_supports_transactions_snapshots_and_maintenance() -> Result<(
     db.compact()?;
     assert_eq!(db.overlay_memory_usage(), 0);
     assert_eq!(snapshot.get(b"key")?, Some(b"old".as_slice()));
-    db.vacuum()?;
-    db.verify()?;
-    assert_eq!(db.get(b"other")?, Some(b"two".as_slice()));
-    assert!(!db.has_stale_vacuum()?);
-    assert!(!db.remove_stale_vacuum()?);
-    drop(db);
-    assert_eq!(snapshot.get(b"key")?, Some(b"old".as_slice()));
     let entries = snapshot
         .iter()?
         .map(|item| item.map(|(key, value)| (key.to_vec(), value.to_vec())))
@@ -267,6 +261,19 @@ fn memory_database_supports_transactions_snapshots_and_maintenance() -> Result<(
     assert_eq!(entries.get(b"key".as_slice()), Some(&b"old".to_vec()));
     assert_eq!(entries.get(b"gone".as_slice()), Some(&b"value".to_vec()));
     assert_eq!(snapshot.len()?, 2);
+    assert_eq!(
+        db.vacuum()
+            .expect_err("a memory database must enforce the same snapshot rule")
+            .kind(),
+        ErrorKind::WouldBlock
+    );
+    drop(snapshot);
+    db.vacuum()?;
+    db.verify()?;
+    assert_eq!(db.get(b"other")?, Some(b"two".as_slice()));
+    assert!(!db.has_stale_vacuum()?);
+    assert!(!db.remove_stale_vacuum()?);
+    drop(db);
     Ok(())
 }
 

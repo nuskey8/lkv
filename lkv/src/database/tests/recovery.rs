@@ -116,7 +116,6 @@ fn process_crash_never_exposes_a_partial_transaction() -> Result<()> {
 }
 
 #[test]
-#[cfg(not(windows))]
 fn compact_and_vacuum_crash_points_remain_recoverable() -> Result<()> {
     for (operation, crash_points) in [
         (
@@ -170,6 +169,7 @@ fn ignores_partial_log_tail() -> Result<()> {
         .write_all(&[1, 2, 0])?;
     let db = Database::open(&dir)?;
     assert_eq!(db.get(b"safe")?, Some(b"value".as_slice()));
+    drop(db);
     remove_test_database(&dir)?;
     Ok(())
 }
@@ -344,7 +344,6 @@ fn rejects_header_length_corruption_without_truncating_committed_data() -> Resul
 }
 
 #[test]
-#[cfg(not(windows))]
 fn randomized_state_matches_hashmap_across_recovery() -> Result<()> {
     let dir = temp_dir();
     let mut db = Database::open(&dir)?;
@@ -404,7 +403,10 @@ fn partial_write_poisons_handle_and_reopen_can_continue() -> Result<()> {
         })
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::WriteZero);
+    #[cfg(not(windows))]
     assert_eq!(db.storage.len()?, length_before);
+    #[cfg(windows)]
+    assert!(db.storage.len()? > length_before);
     assert!(matches!(db.put(b"after", b"unsafe"), Err(Error::Poisoned)));
     drop(db);
     let mut db = Database::open(&dir)?;
