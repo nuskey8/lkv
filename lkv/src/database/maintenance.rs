@@ -22,6 +22,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(windows)]
+use std::{os::windows::ffi::OsStrExt, ptr};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
 impl Database {
     /// Merges all live entries into a fresh immutable base and clears the log.
@@ -132,6 +136,10 @@ impl Database {
         }
         let path = self.path.as_ref().expect("file storage has a path").clone();
         let temporary = compacting_path(&path);
+        #[cfg(windows)]
+        let backup = vacuum_backup_path(&path);
+        #[cfg(windows)]
+        ensure_vacuum_path_available(&backup)?;
         let mut new_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -176,7 +184,11 @@ impl Database {
             let old_storage = std::mem::replace(&mut self.storage, Storage::memory());
             drop(old_storage);
             drop(new_file);
-            if let Err(error) = fs::rename(&temporary, &path) {
+            if let Err(error) = replace_file(&path, &temporary, &backup) {
+                if matches!(fs::symlink_metadata(&path), Err(error) if error.kind() == ErrorKind::NotFound)
+                {
+                    let _ = fs::rename(&backup, &path);
+                }
                 let _ = self.restore_windows_database(&path);
                 return Err(error.into());
             }
@@ -194,6 +206,7 @@ impl Database {
         #[cfg(windows)]
         {
             self.install_windows_vacuum(&path, superblock)?;
+            fs::remove_file(&backup)?;
         }
         if let Some(parent) = path.parent()
             && let Err(error) = sync_directory(parent)
@@ -292,22 +305,26 @@ impl Database {
         Ok(())
     }
 
-    /// Returns whether a regular `<database path>.compacting` file remains from an
+    /// Returns whether a regular temporary or backup file remains from an
     /// interrupted vacuum. Symlinks and other special files are rejected.
     pub fn has_stale_vacuum(&self) -> Result<bool> {
         let Some(path) = self.path.as_ref() else {
             return Ok(false);
         };
-        let temporary = compacting_path(path);
-        match fs::symlink_metadata(&temporary) {
-            Ok(metadata) if metadata.file_type().is_file() => Ok(true),
-            Ok(_) => Err(Error::from_io(
-                ErrorKind::InvalidInput,
-                "vacuum temporary path is not a regular file",
-            )),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.into()),
+        for temporary in [compacting_path(path), vacuum_backup_path(path)] {
+            match fs::symlink_metadata(&temporary) {
+                Ok(metadata) if metadata.file_type().is_file() => return Ok(true),
+                Ok(_) => {
+                    return Err(Error::from_io(
+                        ErrorKind::InvalidInput,
+                        "vacuum temporary path is not a regular file",
+                    ));
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(false)
     }
 
     /// Removes a regular stale vacuum file. The file is locked first so this
@@ -316,39 +333,96 @@ impl Database {
         let Some(path) = self.path.as_ref() else {
             return Ok(false);
         };
-        let temporary = compacting_path(path);
-        let metadata = match fs::symlink_metadata(&temporary) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        if !metadata.file_type().is_file() {
-            return Err(Error::from_io(
-                ErrorKind::InvalidInput,
-                "vacuum temporary path is not a regular file",
-            ));
+        let mut removed = false;
+        for temporary in [compacting_path(path), vacuum_backup_path(path)] {
+            removed |= remove_stale_vacuum_file(&temporary)?;
         }
-        let stale = OpenOptions::new().read(true).write(true).open(&temporary)?;
-        FileExt::try_lock_exclusive(&stale).map_err(|error| {
-            Error::from_io(
-                ErrorKind::WouldBlock,
-                format!("vacuum temporary file is in use: {error}"),
-            )
-        })?;
-        let locked_metadata = fs::symlink_metadata(&temporary)?;
-        if !locked_metadata.file_type().is_file() {
-            return Err(Error::from_io(
-                ErrorKind::InvalidInput,
-                "vacuum temporary path changed while being inspected",
-            ));
-        }
-        drop(stale);
-        fs::remove_file(&temporary)?;
-        if let Some(parent) = path.parent() {
+        if removed && let Some(parent) = path.parent() {
             sync_directory(parent)?;
         }
-        Ok(true)
+        Ok(removed)
     }
+}
+
+fn remove_stale_vacuum_file(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(Error::from_io(
+            ErrorKind::InvalidInput,
+            "vacuum temporary path is not a regular file",
+        ));
+    }
+    let stale = OpenOptions::new().read(true).write(true).open(path)?;
+    FileExt::try_lock_exclusive(&stale).map_err(|error| {
+        Error::from_io(
+            ErrorKind::WouldBlock,
+            format!("vacuum temporary file is in use: {error}"),
+        )
+    })?;
+    let locked_metadata = fs::symlink_metadata(path)?;
+    if !locked_metadata.file_type().is_file() {
+        return Err(Error::from_io(
+            ErrorKind::InvalidInput,
+            "vacuum temporary path changed while being inspected",
+        ));
+    }
+    FileExt::unlock(&stale)?;
+    drop(stale);
+    fs::remove_file(path)?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn ensure_vacuum_path_available(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(Error::from_io(
+            ErrorKind::AlreadyExists,
+            "stale vacuum backup already exists",
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(windows)]
+fn replace_file(replaced: &Path, replacement: &Path, backup: &Path) -> io::Result<()> {
+    let replaced = nul_terminated_path(replaced)?;
+    let replacement = nul_terminated_path(replacement)?;
+    let backup = nul_terminated_path(backup)?;
+    // SAFETY: all paths are NUL-terminated UTF-16 strings and the remaining
+    // pointer arguments are reserved and required to be null.
+    if unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            backup.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn nul_terminated_path(path: &Path) -> io::Result<Vec<u16>> {
+    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if path.contains(&0) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "path contains an interior NUL",
+        ));
+    }
+    path.push(0);
+    Ok(path)
 }
 
 #[cfg(windows)]
@@ -479,5 +553,11 @@ impl Seek for OffsetBuffer {
 pub fn compacting_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".compacting");
+    PathBuf::from(name)
+}
+
+pub(super) fn vacuum_backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".vacuum-backup");
     PathBuf::from(name)
 }

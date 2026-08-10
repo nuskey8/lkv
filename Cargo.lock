@@ -81,6 +81,7 @@ dependencies = [
  "memmap2",
  "rustc-hash",
  "tempfile",
+ "windows-sys",
  "xxhash-rust",
 ]
 

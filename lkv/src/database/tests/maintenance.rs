@@ -181,6 +181,14 @@ fn stale_vacuum_file_is_inspected_and_removed_explicitly() -> Result<()> {
     assert!(db.remove_stale_vacuum()?);
     assert!(!db.has_stale_vacuum()?);
     assert!(!db.remove_stale_vacuum()?);
+
+    let backup = super::super::maintenance::vacuum_backup_path(
+        db.path.as_deref().expect("persistent test database"),
+    );
+    fs::write(&backup, b"old vacuum generation")?;
+    assert!(db.has_stale_vacuum()?);
+    assert!(db.remove_stale_vacuum()?);
+    assert!(!db.has_stale_vacuum()?);
     drop(db);
     remove_test_database(&dir)?;
     Ok(())
