@@ -14,21 +14,25 @@ use std::sync::Arc;
 /// Read-only transaction of the database.
 pub struct ReadTransaction<'db> {
     db: &'db Database,
+    view: ReadView<'db>,
 }
 
 impl<'db> ReadTransaction<'db> {
     pub(crate) fn new(db: &'db Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            view: db.read_view(),
+        }
     }
 
     /// Returns the value for the given key.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<&[u8]>> {
-        self.db.get(key)
+        self.view.get(key.as_ref())
     }
 
     /// Returns whether the given key is present in the database.
     pub fn contains_key(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        self.db.contains_key(key)
+        Ok(self.get(key)?.is_some())
     }
 
     /// Iterates over all entries in the database.
