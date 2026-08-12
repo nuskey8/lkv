@@ -500,30 +500,44 @@ fn load_storage_state(
     let superblock = superblock::read_latest_from(storage, storage_len)?;
     let mapping = storage.load_immutable(superblock.base_offset(), superblock.base_size())?;
     let mut base = ActiveBase::open(mapping, superblock, options.verification)?;
-    let overlay_scan = scan_overlay(storage, base.log_start, storage_len)?;
+    let initial_overlay_size = storage_len
+        .checked_sub(base.log_start)
+        .ok_or_else(|| Error::invalid_base("overlay range precedes active Base"))?;
+    let mut overlay_scan = if initial_overlay_size == 0 {
+        recovery::OverlayScan::empty(base.log_start)
+    } else if storage.is_memory() {
+        return Err(Error::invalid_base(
+            "in-memory database cannot contain a persisted Overlay",
+        ));
+    } else {
+        let mapping = storage.load_immutable(base.log_start, initial_overlay_size)?;
+        scan_overlay(mapping, base.log_start)?
+    };
     let valid_len = overlay_scan.valid_len();
     if valid_len < storage_len {
         // SetEndOfFile fails on Windows while any section of the file is mapped.
         // Validate first, then temporarily release our Base mapping
         // before discarding an incomplete Overlay tail.
+        overlay_scan.release_mapping();
         drop(base);
         storage.set_len(valid_len)?;
         storage.sync_data()?;
         let mapping = storage.load_immutable(superblock.base_offset(), superblock.base_size())?;
         base = ActiveBase::open(mapping, superblock, options.verification)?;
-    }
-    let overlay_size = valid_len
-        .checked_sub(base.log_start)
-        .ok_or_else(|| Error::invalid_base("overlay range precedes active Base"))?;
-    let overlay = if storage.is_memory() {
-        OverlayState::new(OverlayMap::memory())
-    } else {
-        let overlay_mapping = if overlay_size == 0 {
+        let overlay_size = valid_len
+            .checked_sub(base.log_start)
+            .ok_or_else(|| Error::invalid_base("overlay range precedes active Base"))?;
+        let mapping = if overlay_size == 0 {
             None
         } else {
             Some(storage.load_immutable(base.log_start, overlay_size)?)
         };
-        let (index, memory) = overlay_scan.into_index(overlay_mapping, base.log_start)?;
+        overlay_scan.replace_mapping(mapping);
+    }
+    let overlay = if storage.is_memory() {
+        OverlayState::new(OverlayMap::memory())
+    } else {
+        let (index, memory) = overlay_scan.into_index();
         OverlayState::with_memory(index, memory)
     };
     storage.seek(SeekFrom::End(0))?;
