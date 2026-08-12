@@ -382,7 +382,8 @@ impl OverlayMap {
         let previous_tail = std::mem::replace(tail, HashTable::new());
         for entry in previous_tail {
             debug_assert_eq!(entry.mapped.slices(mapping).0, entry.key.as_slice());
-            debug_assert!(insert_mapped_record(table, mapping, entry.mapped).is_none());
+            let previous = insert_mapped_record(table, mapping, entry.mapped);
+            debug_assert!(previous.is_none());
         }
         let mut removed = 0usize;
         let mut added = 0usize;
