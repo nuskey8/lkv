@@ -72,6 +72,12 @@ fn temp_dir() -> PathBuf {
     path
 }
 
+fn copy_test_database(source: &Path) -> Result<PathBuf> {
+    let target = temp_path();
+    fs::copy(source, &target)?;
+    Ok(target)
+}
+
 fn remove_test_database(path: &Path) -> Result<()> {
     let parent = path
         .parent()

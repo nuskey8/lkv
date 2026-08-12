@@ -63,6 +63,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -90,10 +96,11 @@ dependencies = [
 
 [[package]]
 name = "lkv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "fs2",
+ "hashbrown",
  "memmap2",
  "rustc-hash",
  "xxhash-rust",

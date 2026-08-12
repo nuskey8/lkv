@@ -18,5 +18,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "recovery_model"
+path = "fuzz_targets/recovery_model.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
