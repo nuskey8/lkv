@@ -6,6 +6,7 @@ use crate::format::segment::{
 use crate::format::superblock::Superblock;
 use crate::options::VerificationMode;
 use crc32c::crc32c;
+use hashbrown::HashTable;
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
 use std::io::ErrorKind;
@@ -13,9 +14,81 @@ use std::ops::Deref;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use xxhash_rust::xxh3::xxh3_64;
 
 pub type KeyMap<V> = FxHashMap<Vec<u8>, V>;
 pub const MAPPED_VALUE_THRESHOLD: usize = 1024 * 1024;
+
+#[derive(Clone)]
+pub struct OverlayMap<V> {
+    table: HashTable<(Vec<u8>, V)>,
+}
+
+impl<V> Default for OverlayMap<V> {
+    fn default() -> Self {
+        Self {
+            table: HashTable::new(),
+        }
+    }
+}
+
+impl<V> OverlayMap<V> {
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
+        self.get_hashed(key, xxh3_64(key))
+    }
+
+    #[inline]
+    pub fn get_hashed(&self, key: &[u8], hash: u64) -> Option<&V> {
+        self.table
+            .find(hash, |(candidate, _)| candidate.as_slice() == key)
+            .map(|(_, value)| value)
+    }
+
+    pub fn insert(&mut self, key: Vec<u8>, value: V) -> Option<V> {
+        let hash = xxh3_64(&key);
+        if let Some((_, previous)) = self
+            .table
+            .find_mut(hash, |(candidate, _)| candidate == &key)
+        {
+            return Some(std::mem::replace(previous, value));
+        }
+        self.table
+            .insert_unique(hash, (key, value), |(key, _)| xxh3_64(key));
+        None
+    }
+
+    pub fn remove(&mut self, key: &[u8]) -> Option<V> {
+        let hash = xxh3_64(key);
+        self.table
+            .find_entry(hash, |(candidate, _)| candidate.as_slice() == key)
+            .ok()
+            .map(|entry| entry.remove().0.1)
+    }
+
+    pub fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), hashbrown::TryReserveError> {
+        self.table.try_reserve(additional, |(key, _)| xxh3_64(key))
+    }
+
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn iter(&self) -> hashbrown::hash_table::Iter<'_, (Vec<u8>, V)> {
+        self.table.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+}
 
 /// Immutable bytes backing an installed Base generation.
 #[derive(Clone)]
@@ -190,12 +263,12 @@ fn overlay_entry_memory(key: &[u8], entry: &OverlayEntry) -> usize {
 }
 
 pub struct OverlayState {
-    pub index: Arc<KeyMap<OverlayEntry>>,
+    pub index: Arc<OverlayMap<OverlayEntry>>,
     pub memory: usize,
 }
 
 impl OverlayState {
-    pub fn new(index: KeyMap<OverlayEntry>) -> Self {
+    pub fn new(index: OverlayMap<OverlayEntry>) -> Self {
         let memory = index
             .iter()
             .map(|(key, entry)| overlay_entry_memory(key, entry))
@@ -220,7 +293,7 @@ impl OverlayState {
     }
 
     pub fn clear(&mut self) {
-        self.index = Arc::new(KeyMap::default());
+        self.index = Arc::new(OverlayMap::default());
         self.memory = 0;
     }
 }
@@ -308,5 +381,27 @@ impl SegmentVerifier {
 
     pub fn mark_semantically_verified(&self) {
         self.semantically_verified.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OverlayMap;
+    use xxhash_rust::xxh3::xxh3_64;
+
+    #[test]
+    fn overlay_map_uses_the_base_key_hash() {
+        let mut map = OverlayMap::default();
+        map.insert(Vec::new(), 1);
+        map.insert(b"overlay-key".to_vec(), 2);
+
+        for (key, expected) in [(b"".as_slice(), 1), (b"overlay-key".as_slice(), 2)] {
+            let hash = xxh3_64(key);
+            assert_eq!(map.get(key), Some(&expected));
+            assert_eq!(map.get_hashed(key, hash), Some(&expected));
+        }
+
+        let occupied_hash = xxh3_64(b"overlay-key");
+        assert_eq!(map.get_hashed(b"other-key", occupied_hash), None);
     }
 }

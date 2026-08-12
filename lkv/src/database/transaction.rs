@@ -1,6 +1,7 @@
 use super::Database;
 use super::state::{
-    BaseBytes, KeyMap, MAPPED_VALUE_THRESHOLD, OverlayEntry, SegmentVerifier, ValueBytes,
+    BaseBytes, KeyMap, MAPPED_VALUE_THRESHOLD, OverlayEntry, OverlayMap, SegmentVerifier,
+    ValueBytes,
 };
 use super::view::{BaseView, ReadView};
 use crate::format::log::MAX_LOG_PAYLOAD_SIZE;
@@ -330,7 +331,7 @@ pub struct RawEntries<'a> {
     pub base_trusted: bool,
     pending_error: Option<Error>,
     finished: bool,
-    overlay: std::collections::hash_map::Iter<'a, Vec<u8>, OverlayEntry>,
+    overlay: hashbrown::hash_table::Iter<'a, (Vec<u8>, OverlayEntry)>,
 }
 
 impl<'a> RawEntries<'a> {
@@ -438,7 +439,7 @@ pub struct Snapshot {
     base: BaseBytes,
     verification: VerificationMode,
     base_verifier: Arc<SegmentVerifier>,
-    pub(crate) overlay_index: Arc<KeyMap<OverlayEntry>>,
+    pub(crate) overlay_index: Arc<OverlayMap<OverlayEntry>>,
     base_offset: u64,
     base_slots: u64,
     base_len: usize,
@@ -450,7 +451,7 @@ impl Snapshot {
         base: BaseBytes,
         verification: VerificationMode,
         base_verifier: Arc<SegmentVerifier>,
-        overlay_index: Arc<KeyMap<OverlayEntry>>,
+        overlay_index: Arc<OverlayMap<OverlayEntry>>,
         base_metadata: (u64, u64, usize),
         database_snapshot: Arc<()>,
     ) -> Self {
