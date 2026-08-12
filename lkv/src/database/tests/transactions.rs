@@ -38,6 +38,38 @@ fn write_read_delete_reopen_and_compact() -> Result<()> {
 }
 
 #[test]
+fn mapped_overlay_promotion_keeps_the_existing_tail() -> Result<()> {
+    let path = temp_dir();
+    let mut db = Database::open(&path)?;
+    let value = vec![0x5a; OVERLAY_MAPPING_THRESHOLD / 5];
+
+    {
+        let mut transaction = db.begin_write()?;
+        for index in 0..4u8 {
+            transaction.put([index], &value)?;
+        }
+        transaction.commit()?;
+    }
+    assert_eq!(db.stats()?.overlay_entries, 4);
+
+    {
+        let mut transaction = db.begin_write()?;
+        for index in 4..6u8 {
+            transaction.put([index], &value)?;
+        }
+        transaction.commit()?;
+    }
+    assert_eq!(db.stats()?.overlay_entries, 6);
+    for index in 0..6u8 {
+        assert_eq!(db.get([index])?, Some(value.as_slice()));
+    }
+
+    drop(db);
+    remove_test_database(&path)?;
+    Ok(())
+}
+
+#[test]
 fn rejects_a_second_writer() -> Result<()> {
     let dir = temp_dir();
     let db = Database::open(&dir)?;
