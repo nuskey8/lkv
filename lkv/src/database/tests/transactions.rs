@@ -1,5 +1,5 @@
 use super::*;
-use crate::database::state::MAPPED_VALUE_THRESHOLD;
+use crate::database::state::{MAPPED_VALUE_THRESHOLD, OVERLAY_MAPPING_THRESHOLD};
 use std::thread;
 
 #[test]
@@ -346,20 +346,60 @@ fn recovered_values_share_one_overlay_mapping() -> Result<()> {
     drop(db);
 
     let db = Database::open(&dir)?;
-    let mapping = |key: &[u8]| match db.overlay.index.get(key).unwrap() {
-        OverlayEntry::Put(ValueBytes::Mapped {
-            bytes: BaseBytes::Mapped(mapping),
-            ..
-        }) => mapping,
-        _ => panic!("recovered file values must be mapped"),
-    };
-    assert!(Arc::ptr_eq(mapping(b"small"), mapping(b"large")));
+    assert!(matches!(
+        db.overlay.index.mapped_bytes(),
+        Some(BaseBytes::Mapped(_))
+    ));
     assert_eq!(db.get(b"small")?, Some(small.as_slice()));
     assert_eq!(db.get(b"large")?, Some(large.as_slice()));
     assert_eq!(
         db.stats()?.overlay_memory_bytes,
         b"small".len() + small.len() + b"large".len()
     );
+    drop(db);
+    remove_test_database(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn committed_file_overlay_tail_is_promoted_to_one_shared_mapping() -> Result<()> {
+    let dir = temp_dir();
+    let mut db = Database::open(&dir)?;
+    db.put(b"mapped-key", b"mapped-value")?;
+    assert!(db.overlay.index.mapped_bytes().is_none());
+
+    let large = vec![0x5a; OVERLAY_MAPPING_THRESHOLD];
+    db.put(b"mapping-trigger", &large)?;
+
+    let mapped_len = {
+        let mapping = db
+            .overlay
+            .index
+            .mapped_bytes()
+            .expect("file Overlay must retain one shared mapping");
+        let mapping_start = mapping.as_ptr() as usize;
+        let mapping_end = mapping_start + mapping.len();
+        let value = db.get(b"mapped-key")?.unwrap();
+        assert!((mapping_start..mapping_end).contains(&(value.as_ptr() as usize)));
+        let (key, iterated_value) = db
+            .iter()?
+            .find(|entry| entry.as_ref().is_ok_and(|(key, _)| *key == b"mapped-key"))
+            .unwrap()?;
+        assert!((mapping_start..mapping_end).contains(&(key.as_ptr() as usize)));
+        assert_eq!(iterated_value, value);
+        mapping.len()
+    };
+
+    db.put(b"mapped-key", b"tail-value")?;
+    assert_eq!(db.get(b"mapped-key")?, Some(b"tail-value".as_slice()));
+    assert_eq!(db.overlay.index.mapped_bytes().unwrap().len(), mapped_len);
+    assert_eq!(
+        db.iter()?
+            .filter(|entry| entry.as_ref().is_ok_and(|(key, _)| *key == b"mapped-key"))
+            .count(),
+        1
+    );
+
     drop(db);
     remove_test_database(&dir)?;
     Ok(())

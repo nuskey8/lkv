@@ -13,7 +13,7 @@ use crate::format::segment::{self, EMPTY_SEGMENT_SIZE, segment_metadata_checksum
 use crate::format::superblock::{self, DATA_START, Superblock};
 use crate::options::DatabaseOptions;
 use fs2::FileExt;
-use state::{ActiveBase, MAPPED_VALUE_THRESHOLD};
+use state::{ActiveBase, MappedMutation, OverlayMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -23,7 +23,9 @@ use storage::Storage;
 use transaction::RawEntries;
 use view::{BaseView, ReadView};
 
-pub use state::{BaseBytes, KeyMap, OverlayEntry, OverlayState, ValueBytes};
+#[cfg(test)]
+pub use state::{BaseBytes, ValueBytes};
+pub use state::{KeyMap, OverlayEntry, OverlayState};
 pub use transaction::{Entries, ReadTransaction, ReservedValue, Snapshot, WriteTransaction};
 
 const LOG_WRITE_BUFFER_SIZE: usize = 64 * 1024;
@@ -314,41 +316,46 @@ impl Database {
             .ok_or_else(|| Error::from_io(ErrorKind::InvalidInput, "batch record size overflow"))?;
         self.ensure_capacity(batch_record_len)?;
         let rollback_offset = self.storage.seek(SeekFrom::End(0))?;
+        let batch_offset = rollback_offset
+            .checked_sub(self.base.log_start)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| Error::other("Overlay batch offset overflow"))?;
+        let mutations = mapped_mutations(&staged, batch_offset)?;
         if let Err(error) = append(&mut self.storage, &staged, &value_checksums) {
             return self.rollback_or_poison(rollback_offset, error);
         }
-        let mapped = if !self.storage.is_memory()
-            && staged.values().any(|entry| {
-                matches!(entry, OverlayEntry::Put(value) if value.len() >= MAPPED_VALUE_THRESHOLD)
-            })
-        {
-            let record_len = match self.storage.len().and_then(|len| {
-                len.checked_sub(rollback_offset)
-                    .ok_or_else(|| Error::other("storage shrank while committing a batch"))
-            }) {
-                Ok(len) => len,
-                Err(error) => return self.rollback_or_poison(rollback_offset, error),
-            };
-            match self.storage.load_immutable(rollback_offset, record_len) {
-                Ok(mapping) => Some(mapping),
-                Err(error) => return self.rollback_or_poison(rollback_offset, error),
-            }
-        } else {
-            None
-        };
-        let committed = match committed_entries(staged, mapped) {
-            Ok(entries) => entries,
-            Err(error) => return self.rollback_or_poison(rollback_offset, error),
-        };
         failpoints::crash_process_if_requested("after_batch_write");
         if let Err(error) = self.storage.sync_data() {
-            // Windows cannot truncate a range while it is still mapped.
-            drop(committed);
             return self.rollback_or_poison(rollback_offset, error);
         }
         failpoints::crash_process_if_requested("after_batch_sync");
-        for (key, entry) in committed {
-            self.set_overlay_entry(key, entry);
+        let overlay_size = match self.storage.len().and_then(|len| {
+            len.checked_sub(self.base.log_start)
+                .ok_or_else(|| Error::other("Overlay range precedes the active Base"))
+        }) {
+            Ok(size) => size,
+            Err(error) => return self.rollback_or_poison(rollback_offset, error),
+        };
+        let overlay_size_usize = match usize::try_from(overlay_size) {
+            Ok(size) => size,
+            Err(_) => {
+                return self.rollback_or_poison(
+                    rollback_offset,
+                    Error::other("Overlay mapping size overflow"),
+                );
+            }
+        };
+        if self.overlay.needs_mapping(overlay_size_usize) {
+            let mapping = match self
+                .storage
+                .load_immutable(self.base.log_start, overlay_size)
+            {
+                Ok(mapping) => mapping,
+                Err(error) => return self.rollback_or_poison(rollback_offset, error),
+            };
+            self.overlay.install_mapped(mapping, mutations);
+        } else {
+            self.overlay.install_tail(staged, mutations);
         }
         Ok(())
     }
@@ -507,68 +514,47 @@ fn load_storage_state(
     let overlay_size = valid_len
         .checked_sub(base.log_start)
         .ok_or_else(|| Error::invalid_base("overlay range precedes active Base"))?;
-    let overlay_mapping = if overlay_size == 0 {
-        None
+    let overlay = if storage.is_memory() {
+        OverlayState::new(OverlayMap::memory())
     } else {
-        Some(storage.load_immutable(base.log_start, overlay_size)?)
+        let overlay_mapping = if overlay_size == 0 {
+            None
+        } else {
+            Some(storage.load_immutable(base.log_start, overlay_size)?)
+        };
+        let (index, memory) = overlay_scan.into_index(overlay_mapping, base.log_start)?;
+        OverlayState::with_memory(index, memory)
     };
-    let overlay_index = overlay_scan.into_index(overlay_mapping, base.log_start)?;
     storage.seek(SeekFrom::End(0))?;
-    Ok((base, OverlayState::new(overlay_index)))
+    Ok((base, overlay))
 }
 
-fn committed_entries(
-    mut staged: KeyMap<OverlayEntry>,
-    mapping: Option<BaseBytes>,
-) -> Result<KeyMap<OverlayEntry>> {
-    let Some(mapping) = mapping else {
-        return Ok(staged);
-    };
-    let bytes = &mapping[..];
-    let count_end = LOG_HEADER_SIZE + 4;
-    let count = bytes
-        .get(LOG_HEADER_SIZE..count_end)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize)
-        .ok_or_else(|| Error::other("written batch is missing its operation count"))?;
-    let mut cursor = count_end;
-    let mut committed = KeyMap::default();
-    for _ in 0..count {
-        let header_end = cursor
-            .checked_add(9)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| Error::other("written batch has a truncated operation"))?;
-        let header = &bytes[cursor..header_end];
-        let key_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
-        let value_len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
-        let key_end = header_end
-            .checked_add(key_len)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| Error::other("written batch has a truncated key"))?;
-        let value_end = key_end
-            .checked_add(value_len)
-            .filter(|end| *end <= bytes.len())
-            .ok_or_else(|| Error::other("written batch has a truncated value"))?;
-        let (key, entry) = staged
-            .remove_entry(&bytes[header_end..key_end])
-            .ok_or_else(|| Error::other("written batch key is missing from staged entries"))?;
-        let entry = match entry {
-            OverlayEntry::Put(value) if value.len() >= MAPPED_VALUE_THRESHOLD => {
-                OverlayEntry::Put(ValueBytes::Mapped {
-                    bytes: mapping.clone(),
-                    range: key_end..value_end,
-                })
-            }
-            entry => entry,
+fn mapped_mutations(
+    staged: &KeyMap<OverlayEntry>,
+    batch_offset: usize,
+) -> Result<Vec<MappedMutation>> {
+    let mut cursor = batch_offset
+        .checked_add(LOG_HEADER_SIZE + 4)
+        .ok_or_else(|| Error::other("Overlay batch layout overflow"))?;
+    let mut mutations = Vec::new();
+    mutations
+        .try_reserve_exact(staged.len())
+        .map_err(|_| Error::from_io(ErrorKind::OutOfMemory, "could not reserve Overlay entries"))?;
+    for (key, entry) in staged {
+        mutations.push(MappedMutation {
+            operation_offset: cursor,
+        });
+        let value_len = match entry {
+            OverlayEntry::Put(value) => value.len(),
+            OverlayEntry::Delete => 0,
         };
-        committed.insert(key, entry);
-        cursor = value_end;
+        cursor = cursor
+            .checked_add(9)
+            .and_then(|cursor| cursor.checked_add(key.len()))
+            .and_then(|cursor| cursor.checked_add(value_len))
+            .ok_or_else(|| Error::other("Overlay operation range overflow"))?;
     }
-    if cursor != bytes.len() || !staged.is_empty() {
-        return Err(Error::other(
-            "written batch layout does not match staged entries",
-        ));
-    }
-    Ok(committed)
+    Ok(mutations)
 }
 
 fn open_database_file(path: &Path) -> Result<File> {

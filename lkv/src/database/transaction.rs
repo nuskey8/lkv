@@ -331,7 +331,7 @@ pub struct RawEntries<'a> {
     pub base_trusted: bool,
     pending_error: Option<Error>,
     finished: bool,
-    overlay: hashbrown::hash_table::Iter<'a, (Vec<u8>, OverlayEntry)>,
+    overlay: super::state::OverlayIter<'a>,
 }
 
 impl<'a> RawEntries<'a> {
@@ -390,9 +390,9 @@ impl<'a> Iterator for RawEntries<'a> {
             self.finished = true;
             return None;
         }
-        for (key, entry) in self.overlay.by_ref() {
-            if let OverlayEntry::Put(value) = entry {
-                return Some((key, value.as_slice()));
+        for (key, value) in self.overlay.by_ref() {
+            if let Some(value) = value {
+                return Some((key, value));
             }
         }
         self.finished = true;
@@ -439,7 +439,7 @@ pub struct Snapshot {
     base: BaseBytes,
     verification: VerificationMode,
     base_verifier: Arc<SegmentVerifier>,
-    pub(crate) overlay_index: Arc<OverlayMap<OverlayEntry>>,
+    pub(crate) overlay_index: Arc<OverlayMap>,
     base_offset: u64,
     base_slots: u64,
     base_len: usize,
@@ -451,7 +451,7 @@ impl Snapshot {
         base: BaseBytes,
         verification: VerificationMode,
         base_verifier: Arc<SegmentVerifier>,
-        overlay_index: Arc<OverlayMap<OverlayEntry>>,
+        overlay_index: Arc<OverlayMap>,
         base_metadata: (u64, u64, usize),
         database_snapshot: Arc<()>,
     ) -> Self {

@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::format::log::Marker;
 use crate::format::segment::{
     CHECKSUM_BLOCK_SIZE, SegmentLayout, read_base_header, segment_layout,
     segment_metadata_checksum, validate_base, verify_segment_blocks,
@@ -18,77 +19,7 @@ use xxhash_rust::xxh3::xxh3_64;
 
 pub type KeyMap<V> = FxHashMap<Vec<u8>, V>;
 pub const MAPPED_VALUE_THRESHOLD: usize = 1024 * 1024;
-
-#[derive(Clone)]
-pub struct OverlayMap<V> {
-    table: HashTable<(Vec<u8>, V)>,
-}
-
-impl<V> Default for OverlayMap<V> {
-    fn default() -> Self {
-        Self {
-            table: HashTable::new(),
-        }
-    }
-}
-
-impl<V> OverlayMap<V> {
-    #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<&V> {
-        self.get_hashed(key, xxh3_64(key))
-    }
-
-    #[inline]
-    pub fn get_hashed(&self, key: &[u8], hash: u64) -> Option<&V> {
-        self.table
-            .find(hash, |(candidate, _)| candidate.as_slice() == key)
-            .map(|(_, value)| value)
-    }
-
-    pub fn insert(&mut self, key: Vec<u8>, value: V) -> Option<V> {
-        let hash = xxh3_64(&key);
-        if let Some((_, previous)) = self
-            .table
-            .find_mut(hash, |(candidate, _)| candidate == &key)
-        {
-            return Some(std::mem::replace(previous, value));
-        }
-        self.table
-            .insert_unique(hash, (key, value), |(key, _)| xxh3_64(key));
-        None
-    }
-
-    pub fn remove(&mut self, key: &[u8]) -> Option<V> {
-        let hash = xxh3_64(key);
-        self.table
-            .find_entry(hash, |(candidate, _)| candidate.as_slice() == key)
-            .ok()
-            .map(|entry| entry.remove().0.1)
-    }
-
-    pub fn try_reserve(
-        &mut self,
-        additional: usize,
-    ) -> std::result::Result<(), hashbrown::TryReserveError> {
-        self.table.try_reserve(additional, |(key, _)| xxh3_64(key))
-    }
-
-    pub fn contains_key(&self, key: &[u8]) -> bool {
-        self.get(key).is_some()
-    }
-
-    pub fn iter(&self) -> hashbrown::hash_table::Iter<'_, (Vec<u8>, V)> {
-        self.table.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.table.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.table.is_empty()
-    }
-}
+pub const OVERLAY_MAPPING_THRESHOLD: usize = 1024 * 1024;
 
 /// Immutable bytes backing an installed Base generation.
 #[derive(Clone)]
@@ -254,6 +185,378 @@ pub enum OverlayEntry {
     Delete,
 }
 
+const OPERATION_HEADER_SIZE: usize = 9;
+
+#[derive(Clone, Copy)]
+pub(crate) struct MappedRecord(usize);
+
+impl MappedRecord {
+    fn checked_slices(self, bytes: &[u8]) -> Option<(&[u8], Option<&[u8]>)> {
+        let header_end = self.0.checked_add(OPERATION_HEADER_SIZE)?;
+        let header = bytes.get(self.0..header_end)?;
+        let marker = Marker::from_byte(header[0])?;
+        if !matches!(marker, Marker::Put | Marker::Delete) {
+            return None;
+        }
+
+        let key_len = u32::from_le_bytes(header[1..5].try_into().unwrap()) as usize;
+        let value_len = u32::from_le_bytes(header[5..9].try_into().unwrap()) as usize;
+        if marker == Marker::Delete && value_len != 0 {
+            return None;
+        }
+
+        let key_end = header_end.checked_add(key_len)?;
+        let value_end = key_end.checked_add(value_len)?;
+        let key = bytes.get(header_end..key_end)?;
+        let value = match marker {
+            Marker::Put => Some(bytes.get(key_end..value_end)?),
+            Marker::Delete => None,
+            _ => unreachable!(),
+        };
+
+        Some((key, value))
+    }
+
+    #[inline]
+    fn slices(self, bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
+        self.checked_slices(bytes)
+            .expect("installed Overlay record must remain valid")
+    }
+
+    fn memory_charge(self, bytes: &[u8]) -> usize {
+        let (key, value) = self.slices(bytes);
+        key.len()
+            + value.map_or(0, |value| {
+                if value.len() < MAPPED_VALUE_THRESHOLD {
+                    value.len()
+                } else {
+                    0
+                }
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct MappedMutation {
+    pub operation_offset: usize,
+}
+
+impl MappedMutation {
+    fn into_record(self) -> MappedRecord {
+        MappedRecord(self.operation_offset)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TailOverlayEntry {
+    key: Vec<u8>,
+    value: OverlayEntry,
+    mapped: MappedRecord,
+}
+
+#[derive(Clone)]
+pub enum OverlayMap {
+    Memory(HashTable<(Vec<u8>, OverlayEntry)>),
+    Mapped {
+        bytes: Option<BaseBytes>,
+        table: HashTable<MappedRecord>,
+        tail: HashTable<TailOverlayEntry>,
+    },
+}
+
+impl OverlayMap {
+    pub fn memory() -> Self {
+        Self::Memory(HashTable::new())
+    }
+
+    pub fn mapped(bytes: Option<BaseBytes>) -> Self {
+        Self::Mapped {
+            bytes,
+            table: HashTable::new(),
+            tail: HashTable::new(),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Option<Option<&[u8]>> {
+        self.get_hashed(key, xxh3_64(key))
+    }
+
+    #[inline]
+    pub fn get_hashed(&self, key: &[u8], hash: u64) -> Option<Option<&[u8]>> {
+        match self {
+            Self::Memory(table) => table
+                .find(hash, |(candidate, _)| candidate.as_slice() == key)
+                .map(|(_, entry)| match entry {
+                    OverlayEntry::Put(value) => Some(value.as_slice()),
+                    OverlayEntry::Delete => None,
+                }),
+            Self::Mapped { bytes, table, tail } => {
+                if let Some(entry) = tail.find(hash, |entry| entry.key.as_slice() == key) {
+                    return Some(match &entry.value {
+                        OverlayEntry::Put(value) => Some(value.as_slice()),
+                        OverlayEntry::Delete => None,
+                    });
+                }
+                let bytes = bytes.as_deref()?;
+                table
+                    .find(hash, |record| record.slices(bytes).0 == key)
+                    .map(|record| record.slices(bytes).1)
+            }
+        }
+    }
+
+    pub fn contains_key(&self, key: &[u8]) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn iter(&self) -> OverlayIter<'_> {
+        match self {
+            Self::Memory(table) => OverlayIter::Memory(table.iter()),
+            Self::Mapped { bytes, table, tail } => OverlayIter::Mapped {
+                bytes: bytes.as_deref().unwrap_or(&[]),
+                mapped: table.iter(),
+                tail: tail.iter(),
+            },
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Memory(table) => table.len(),
+            Self::Mapped { table, tail, .. } => table.len() + tail.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn memory_charge(&self) -> usize {
+        match self {
+            Self::Memory(table) => table
+                .iter()
+                .map(|(key, entry)| overlay_entry_memory(key, entry))
+                .sum(),
+            Self::Mapped { bytes, table, tail } => {
+                let bytes = bytes.as_deref().unwrap_or(&[]);
+                table
+                    .iter()
+                    .map(|record| record.memory_charge(bytes))
+                    .sum::<usize>()
+                    + tail
+                        .iter()
+                        .map(|entry| overlay_entry_memory(&entry.key, &entry.value))
+                        .sum::<usize>()
+            }
+        }
+    }
+
+    fn set_memory(&mut self, key: Vec<u8>, value: OverlayEntry) -> Option<OverlayEntry> {
+        let Self::Memory(table) = self else {
+            unreachable!("file Overlay cannot install owned entries")
+        };
+        let hash = xxh3_64(&key);
+        if let Some((_, previous)) = table.find_mut(hash, |(candidate, _)| candidate == &key) {
+            return Some(std::mem::replace(previous, value));
+        }
+        table.insert_unique(hash, (key, value), |(key, _)| xxh3_64(key));
+        None
+    }
+
+    fn install_mapped(
+        &mut self,
+        bytes: BaseBytes,
+        mutations: impl IntoIterator<Item = MappedMutation>,
+    ) -> (usize, usize) {
+        let Self::Mapped {
+            bytes: current,
+            table,
+            tail,
+        } = self
+        else {
+            unreachable!("memory Overlay cannot install mapped entries")
+        };
+        *current = Some(bytes);
+        let mapping = current.as_deref().unwrap();
+        let previous_tail = std::mem::replace(tail, HashTable::new());
+        for entry in previous_tail {
+            debug_assert_eq!(entry.mapped.slices(mapping).0, entry.key.as_slice());
+            debug_assert!(insert_mapped_record(table, mapping, entry.mapped).is_none());
+        }
+        let mut removed = 0usize;
+        let mut added = 0usize;
+        for mutation in mutations {
+            let record = mutation.into_record();
+            added = added.saturating_add(record.memory_charge(mapping));
+            if let Some(previous) = insert_mapped_record(table, mapping, record) {
+                removed = removed.saturating_add(previous.memory_charge(mapping));
+            }
+        }
+        (removed, added)
+    }
+
+    fn install_tail(
+        &mut self,
+        staged: KeyMap<OverlayEntry>,
+        mutations: Vec<MappedMutation>,
+    ) -> (usize, usize) {
+        let Self::Mapped { bytes, table, tail } = self else {
+            unreachable!("memory Overlay cannot install a file tail")
+        };
+        let mapping = bytes.as_deref();
+        let mut removed = 0usize;
+        let mut added = 0usize;
+        for ((key, value), mutation) in staged.into_iter().zip(mutations) {
+            let mapped = mutation.into_record();
+            let hash = xxh3_64(&key);
+            added = added.saturating_add(overlay_entry_memory(&key, &value));
+            if let Some(entry) = tail.find_mut(hash, |entry| entry.key == key) {
+                removed = removed.saturating_add(overlay_entry_memory(&entry.key, &entry.value));
+                entry.value = value;
+                entry.mapped = mapped;
+                continue;
+            }
+            if let Some(old_charge) = mapping.and_then(|mapping| {
+                table
+                    .find_entry(hash, |record| record.slices(mapping).0 == key.as_slice())
+                    .ok()
+                    .map(|entry| entry.remove().0.memory_charge(mapping))
+            }) {
+                removed = removed.saturating_add(old_charge);
+            }
+            tail.insert_unique(hash, TailOverlayEntry { key, value, mapped }, |entry| {
+                xxh3_64(&entry.key)
+            });
+        }
+        (removed, added)
+    }
+
+    pub fn install_recovered(&mut self, mutation: MappedMutation, hash: u64) {
+        let Self::Mapped { bytes, table, .. } = self else {
+            unreachable!("memory Overlay cannot install recovered entries")
+        };
+        let mapping = bytes.as_deref().unwrap();
+        let record = mutation.into_record();
+        debug_assert!(record.checked_slices(mapping).is_some());
+        table.insert_unique(hash, record, |record| xxh3_64(record.slices(mapping).0));
+    }
+
+    pub fn mapped_bytes_len(&self) -> usize {
+        match self {
+            Self::Mapped { bytes, .. } => bytes.as_deref().map_or(0, <[u8]>::len),
+            Self::Memory(_) => 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Memory(table) => *table = HashTable::new(),
+            Self::Mapped { bytes, table, tail } => {
+                *bytes = None;
+                *table = HashTable::new();
+                *tail = HashTable::new();
+            }
+        }
+    }
+
+    pub fn try_reserve_mapped(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), hashbrown::TryReserveError> {
+        let Self::Mapped { bytes, table, .. } = self else {
+            unreachable!("memory Overlay cannot reserve mapped entries")
+        };
+        let mapping = bytes.as_deref().unwrap_or(&[]);
+        table.try_reserve(additional, |record| xxh3_64(record.slices(mapping).0))
+    }
+
+    #[cfg(test)]
+    pub fn mapped_bytes(&self) -> Option<&BaseBytes> {
+        match self {
+            Self::Mapped { bytes, .. } => bytes.as_ref(),
+            Self::Memory(_) => None,
+        }
+    }
+}
+
+fn insert_mapped_record(
+    table: &mut HashTable<MappedRecord>,
+    mapping: &[u8],
+    record: MappedRecord,
+) -> Option<MappedRecord> {
+    let key = record.slices(mapping).0;
+    let hash = xxh3_64(key);
+    if let Some(existing) = table.find_mut(hash, |candidate| candidate.slices(mapping).0 == key) {
+        Some(std::mem::replace(existing, record))
+    } else {
+        table.insert_unique(hash, record, |candidate| {
+            xxh3_64(candidate.slices(mapping).0)
+        });
+        None
+    }
+}
+
+pub enum OverlayIter<'a> {
+    Memory(hashbrown::hash_table::Iter<'a, (Vec<u8>, OverlayEntry)>),
+    Mapped {
+        bytes: &'a [u8],
+        mapped: hashbrown::hash_table::Iter<'a, MappedRecord>,
+        tail: hashbrown::hash_table::Iter<'a, TailOverlayEntry>,
+    },
+}
+
+impl<'a> Iterator for OverlayIter<'a> {
+    type Item = (&'a [u8], Option<&'a [u8]>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Memory(inner) => inner.next().map(|(key, entry)| {
+                let value = match entry {
+                    OverlayEntry::Put(value) => Some(value.as_slice()),
+                    OverlayEntry::Delete => None,
+                };
+                (key.as_slice(), value)
+            }),
+            Self::Mapped {
+                bytes,
+                mapped,
+                tail,
+            } => mapped.next().map_or_else(
+                || {
+                    tail.next().map(|entry| {
+                        let value = match &entry.value {
+                            OverlayEntry::Put(value) => Some(value.as_slice()),
+                            OverlayEntry::Delete => None,
+                        };
+                        (entry.key.as_slice(), value)
+                    })
+                },
+                |record| Some(record.slices(bytes)),
+            ),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Memory(inner) => inner.size_hint(),
+            Self::Mapped { mapped, tail, .. } => {
+                let len = mapped.len() + tail.len();
+                (len, Some(len))
+            }
+        }
+    }
+}
+
+impl ExactSizeIterator for OverlayIter<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Memory(inner) => inner.len(),
+            Self::Mapped { mapped, tail, .. } => mapped.len() + tail.len(),
+        }
+    }
+}
+
 fn overlay_entry_memory(key: &[u8], entry: &OverlayEntry) -> usize {
     key.len()
         + match entry {
@@ -263,16 +566,20 @@ fn overlay_entry_memory(key: &[u8], entry: &OverlayEntry) -> usize {
 }
 
 pub struct OverlayState {
-    pub index: Arc<OverlayMap<OverlayEntry>>,
+    pub index: Arc<OverlayMap>,
     pub memory: usize,
 }
 
 impl OverlayState {
-    pub fn new(index: OverlayMap<OverlayEntry>) -> Self {
-        let memory = index
-            .iter()
-            .map(|(key, entry)| overlay_entry_memory(key, entry))
-            .sum();
+    pub fn new(index: OverlayMap) -> Self {
+        let memory = index.memory_charge();
+        Self {
+            index: Arc::new(index),
+            memory,
+        }
+    }
+
+    pub fn with_memory(index: OverlayMap, memory: usize) -> Self {
         Self {
             index: Arc::new(index),
             memory,
@@ -280,21 +587,41 @@ impl OverlayState {
     }
 
     pub fn set(&mut self, key: Vec<u8>, entry: OverlayEntry) {
+        let charge = overlay_entry_memory(&key, &entry);
+        let key_len = key.len();
         let index = Arc::make_mut(&mut self.index);
-        if let Some(previous) = index.remove(key.as_slice()) {
+        if let Some(previous) = index.set_memory(key, entry) {
             self.memory = self
                 .memory
-                .saturating_sub(overlay_entry_memory(&key, &previous));
+                .saturating_sub(key_len + previous_value_memory(&previous));
         }
-        self.memory = self
-            .memory
-            .saturating_add(overlay_entry_memory(&key, &entry));
-        index.insert(key, entry);
+        self.memory = self.memory.saturating_add(charge);
+    }
+
+    pub fn install_mapped(&mut self, bytes: BaseBytes, mutations: Vec<MappedMutation>) {
+        let (removed, added) = Arc::make_mut(&mut self.index).install_mapped(bytes, mutations);
+        self.memory = self.memory.saturating_sub(removed).saturating_add(added);
+    }
+
+    pub fn needs_mapping(&self, overlay_size: usize) -> bool {
+        overlay_size.saturating_sub(self.index.mapped_bytes_len()) >= OVERLAY_MAPPING_THRESHOLD
+    }
+
+    pub fn install_tail(&mut self, staged: KeyMap<OverlayEntry>, mutations: Vec<MappedMutation>) {
+        let (removed, added) = Arc::make_mut(&mut self.index).install_tail(staged, mutations);
+        self.memory = self.memory.saturating_sub(removed).saturating_add(added);
     }
 
     pub fn clear(&mut self) {
-        self.index = Arc::new(OverlayMap::default());
+        Arc::make_mut(&mut self.index).clear();
         self.memory = 0;
+    }
+}
+
+fn previous_value_memory(entry: &OverlayEntry) -> usize {
+    match entry {
+        OverlayEntry::Put(value) => value.overlay_memory_charge(),
+        OverlayEntry::Delete => 0,
     }
 }
 
@@ -386,19 +713,29 @@ impl SegmentVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::OverlayMap;
+    use super::{MappedRecord, OverlayEntry, OverlayMap, ValueBytes};
     use xxhash_rust::xxh3::xxh3_64;
 
     #[test]
     fn overlay_map_uses_the_base_key_hash() {
-        let mut map = OverlayMap::default();
-        map.insert(Vec::new(), 1);
-        map.insert(b"overlay-key".to_vec(), 2);
+        assert_eq!(
+            std::mem::size_of::<MappedRecord>(),
+            std::mem::size_of::<usize>()
+        );
+        let mut map = OverlayMap::memory();
+        map.set_memory(Vec::new(), OverlayEntry::Put(ValueBytes::Owned(vec![1])));
+        map.set_memory(
+            b"overlay-key".to_vec(),
+            OverlayEntry::Put(ValueBytes::Owned(vec![2])),
+        );
 
-        for (key, expected) in [(b"".as_slice(), 1), (b"overlay-key".as_slice(), 2)] {
+        for (key, expected) in [
+            (b"".as_slice(), &[1][..]),
+            (b"overlay-key".as_slice(), &[2][..]),
+        ] {
             let hash = xxh3_64(key);
-            assert_eq!(map.get(key), Some(&expected));
-            assert_eq!(map.get_hashed(key, hash), Some(&expected));
+            assert_eq!(map.get(key), Some(Some(expected)));
+            assert_eq!(map.get_hashed(key, hash), Some(Some(expected)));
         }
 
         let occupied_hash = xxh3_64(b"overlay-key");
