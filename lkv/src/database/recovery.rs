@@ -1,4 +1,4 @@
-use super::state::{BaseBytes, KeyMap, OverlayEntry, OverlayMap, ValueBytes};
+use super::state::{BaseBytes, KeyMap, MAPPED_VALUE_THRESHOLD, MappedMutation, OverlayMap};
 use crate::format::log::{
     LOG_HEADER_CHECKSUM_OFFSET, LOG_HEADER_SIZE, MAX_BATCH_OPERATIONS, MAX_LOG_PAYLOAD_SIZE,
     Marker, record_checksum, record_checksum_start,
@@ -24,43 +24,37 @@ impl OverlayScan {
         self,
         mapping: Option<BaseBytes>,
         mapping_offset: u64,
-    ) -> Result<OverlayMap<OverlayEntry>> {
-        let mut index = OverlayMap::default();
+    ) -> Result<(OverlayMap, usize)> {
+        let mut index = OverlayMap::mapped(mapping);
         index
-            .try_reserve(self.index.len())
+            .try_reserve_mapped(self.index.len())
             .map_err(|_| Error::invalid_base("Overlay index allocation failed"))?;
+        let mut memory = 0usize;
         for (key, entry) in self.index {
-            let entry = match entry {
-                RecoveredOverlayEntry::Put { offset, len } => {
-                    let bytes = mapping.as_ref().ok_or_else(|| {
-                        Error::invalid_base("recovered Overlay is missing its mapping")
-                    })?;
-                    let start = offset
-                        .checked_sub(mapping_offset)
-                        .and_then(|offset| usize::try_from(offset).ok())
-                        .ok_or_else(|| Error::invalid_base("overlay value offset overflow"))?;
-                    let end = start
-                        .checked_add(len)
-                        .filter(|end| *end <= bytes.len())
-                        .ok_or_else(|| {
-                            Error::invalid_base("overlay value lies outside its mapping")
-                        })?;
-                    OverlayEntry::Put(ValueBytes::Mapped {
-                        bytes: bytes.clone(),
-                        range: start..end,
-                    })
-                }
-                RecoveredOverlayEntry::Delete => OverlayEntry::Delete,
-            };
-            index.insert(key, entry);
+            let operation_offset = entry
+                .operation_offset
+                .checked_sub(mapping_offset)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or_else(|| Error::invalid_base("Overlay operation offset overflow"))?;
+            if operation_offset
+                .checked_add(9)
+                .is_none_or(|end| end > index.mapped_bytes_len())
+            {
+                return Err(Error::invalid_base(
+                    "Overlay operation lies outside its mapping",
+                ));
+            }
+            let mutation = MappedMutation { operation_offset };
+            memory = memory.saturating_add(key.len() + entry.value_memory);
+            index.install_recovered(mutation, xxhash_rust::xxh3::xxh3_64(&key));
         }
-        Ok(index)
+        Ok((index, memory))
     }
 }
 
-enum RecoveredOverlayEntry {
-    Put { offset: u64, len: usize },
-    Delete,
+struct RecoveredOverlayEntry {
+    operation_offset: u64,
+    value_memory: usize,
 }
 
 pub fn scan_overlay(file: &mut (impl Read + Seek), start: u64, end: u64) -> Result<OverlayScan> {
@@ -202,6 +196,12 @@ fn apply_batch_payload<R: BufRead>(
             .map_err(|_| Error::invalid_base("Overlay index allocation failed"))?;
     }
     for _ in 0..count {
+        let operation_offset = payload_offset
+            .checked_add(
+                u64::try_from(reader.consumed())
+                    .map_err(|_| Error::invalid_base("overlay operation offset overflow"))?,
+            )
+            .ok_or_else(|| Error::invalid_base("overlay operation offset overflow"))?;
         let operation = reader.read_operation()?;
         if operation.key_len > recovery.key_buffer.capacity() {
             recovery
@@ -211,20 +211,10 @@ fn apply_batch_payload<R: BufRead>(
         }
         recovery.key_buffer.resize(operation.key_len, 0);
         reader.read_exact(recovery.key_buffer, "truncated batch key")?;
-        let value_offset = payload_offset
-            .checked_add(
-                u64::try_from(reader.consumed())
-                    .map_err(|_| Error::invalid_base("overlay value offset overflow"))?,
-            )
-            .ok_or_else(|| Error::invalid_base("overlay value offset overflow"))?;
         reader.skip(operation.value_len)?;
-        let entry = match operation.marker {
-            Marker::Put => RecoveredOverlayEntry::Put {
-                offset: value_offset,
-                len: operation.value_len,
-            },
-            Marker::Delete => RecoveredOverlayEntry::Delete,
-            _ => unreachable!("batch operation validation rejects non-mutations"),
+        let entry = RecoveredOverlayEntry {
+            operation_offset,
+            value_memory: operation.value_memory,
         };
         if let Some(previous) = recovery.index.get_mut(recovery.key_buffer.as_slice()) {
             *previous = entry;
@@ -241,9 +231,9 @@ fn apply_batch_payload<R: BufRead>(
 }
 
 struct BatchOperation {
-    marker: Marker,
     key_len: usize,
     value_len: usize,
+    value_memory: usize,
 }
 
 struct BatchReader<R> {
@@ -298,9 +288,13 @@ impl<R: BufRead> BatchReader<R> {
             .ok_or_else(|| Error::from_io(ErrorKind::InvalidData, "truncated batch value"))?;
         debug_assert!(data_len <= self.remaining);
         Ok(BatchOperation {
-            marker: marker.expect("validated batch marker"),
             key_len,
             value_len,
+            value_memory: if marker == Some(Marker::Put) && value_len < MAPPED_VALUE_THRESHOLD {
+                value_len
+            } else {
+                0
+            },
         })
     }
 

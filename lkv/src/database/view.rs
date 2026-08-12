@@ -1,4 +1,4 @@
-use super::state::{OverlayEntry, OverlayMap, SegmentVerifier};
+use super::state::{OverlayMap, SegmentVerifier};
 use crate::format::segment::{BASE_HEADER, SLOT_SIZE};
 use crate::{Result, VerificationMode};
 use xxhash_rust::xxh3::xxh3_64;
@@ -14,18 +14,15 @@ pub struct BaseView<'a> {
 #[derive(Clone, Copy)]
 pub struct ReadView<'a> {
     pub base: BaseView<'a>,
-    pub overlay: &'a OverlayMap<OverlayEntry>,
+    pub overlay: &'a OverlayMap,
     pub verification: VerificationMode,
 }
 
 impl<'a> ReadView<'a> {
     pub fn get(self, key: &[u8]) -> Result<Option<&'a [u8]>> {
         let key_hash = xxh3_64(key);
-        if let Some(entry) = self.overlay.get_hashed(key, key_hash) {
-            return Ok(match entry {
-                OverlayEntry::Delete => None,
-                OverlayEntry::Put(value) => Some(value.as_slice()),
-            });
+        if let Some(value) = self.overlay.get_hashed(key, key_hash) {
+            return Ok(value);
         }
         lookup_segment(
             self.base.mapping,
@@ -51,7 +48,7 @@ impl<'a> ReadView<'a> {
         Ok(())
     }
 
-    pub fn overlay_iter(self) -> hashbrown::hash_table::Iter<'a, (Vec<u8>, OverlayEntry)> {
+    pub fn overlay_iter(self) -> super::state::OverlayIter<'a> {
         self.overlay.iter()
     }
 }
