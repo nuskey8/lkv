@@ -433,14 +433,24 @@ impl OverlayMap {
         (removed, added)
     }
 
-    pub fn install_recovered(&mut self, mutation: MappedMutation, hash: u64) {
+    pub fn install_recovered(&mut self, mutation: MappedMutation, hash: u64) -> (usize, usize) {
         let Self::Mapped { bytes, table, .. } = self else {
             unreachable!("memory Overlay cannot install recovered entries")
         };
         let mapping = bytes.as_deref().unwrap();
         let record = mutation.into_record();
         debug_assert!(record.checked_slices(mapping).is_some());
-        table.insert_unique(hash, record, |record| xxh3_64(record.slices(mapping).0));
+        let added = record.memory_charge(mapping);
+        let removed = insert_mapped_record_hashed(table, mapping, record, hash)
+            .map_or(0, |record| record.memory_charge(mapping));
+        (removed, added)
+    }
+
+    pub fn replace_mapped_bytes(&mut self, bytes: Option<BaseBytes>) {
+        let Self::Mapped { bytes: current, .. } = self else {
+            unreachable!("memory Overlay cannot replace mapped bytes")
+        };
+        *current = bytes;
     }
 
     pub fn mapped_bytes_len(&self) -> usize {
@@ -488,6 +498,16 @@ fn insert_mapped_record(
 ) -> Option<MappedRecord> {
     let key = record.slices(mapping).0;
     let hash = xxh3_64(key);
+    insert_mapped_record_hashed(table, mapping, record, hash)
+}
+
+fn insert_mapped_record_hashed(
+    table: &mut HashTable<MappedRecord>,
+    mapping: &[u8],
+    record: MappedRecord,
+    hash: u64,
+) -> Option<MappedRecord> {
+    let key = record.slices(mapping).0;
     if let Some(existing) = table.find_mut(hash, |candidate| candidate.slices(mapping).0 == key) {
         Some(std::mem::replace(existing, record))
     } else {
