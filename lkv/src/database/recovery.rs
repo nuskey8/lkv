@@ -1,4 +1,4 @@
-use super::state::{BaseBytes, KeyMap, OverlayEntry, ValueBytes};
+use super::state::{BaseBytes, KeyMap, OverlayEntry, OverlayMap, ValueBytes};
 use crate::format::log::{
     LOG_HEADER_CHECKSUM_OFFSET, LOG_HEADER_SIZE, MAX_BATCH_OPERATIONS, MAX_LOG_PAYLOAD_SIZE,
     Marker, record_checksum, record_checksum_start,
@@ -24,8 +24,8 @@ impl OverlayScan {
         self,
         mapping: Option<BaseBytes>,
         mapping_offset: u64,
-    ) -> Result<KeyMap<OverlayEntry>> {
-        let mut index = KeyMap::default();
+    ) -> Result<OverlayMap<OverlayEntry>> {
+        let mut index = OverlayMap::default();
         index
             .try_reserve(self.index.len())
             .map_err(|_| Error::invalid_base("Overlay index allocation failed"))?;
