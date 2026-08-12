@@ -1,5 +1,31 @@
 use super::*;
 use crate::VerificationMode;
+use std::collections::BTreeSet;
+
+fn verification_random(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(2_862_933_555_777_941_757)
+        .wrapping_add(3_037_000_493);
+    *state
+}
+
+fn compacted_damage_fixture() -> Result<(PathBuf, u64, u64)> {
+    let path = temp_dir();
+    let mut db = Database::open(&path)?;
+    let mut txn = db.begin_write()?;
+    for index in 0..257u64 {
+        let mut value = vec![index as u8; 31 + (index as usize % 211)];
+        value.extend_from_slice(&index.rotate_left(17).to_le_bytes());
+        txn.put(index.to_le_bytes(), value)?;
+    }
+    txn.commit()?;
+    db.compact()?;
+    let base_offset = db.base.offset;
+    let base_size = db.base.mapping.len() as u64;
+    assert_eq!(db.storage.len()?, base_offset + base_size);
+    drop(db);
+    Ok((path, base_offset, base_size))
+}
 
 #[test]
 fn rejects_corrupt_base_lengths() -> Result<()> {
@@ -105,6 +131,85 @@ fn rejects_base_value_corruption() -> Result<()> {
     assert_eq!(error.kind(), ErrorKind::InvalidData);
     drop(db);
     remove_test_database(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn truncated_compacted_images_are_never_accepted() -> Result<()> {
+    let (source, base_offset, base_size) = compacted_damage_fixture()?;
+    let full_len = base_offset + base_size;
+    let mut cuts = BTreeSet::from([
+        0,
+        1,
+        crate::format::superblock::SUPERBLOCK_SIZE - 1,
+        crate::format::superblock::SUPERBLOCK_SIZE,
+        crate::format::superblock::DATA_START - 1,
+        crate::format::superblock::DATA_START,
+        base_offset + 1,
+        base_offset + base_size / 2,
+        full_len - 1,
+    ]);
+    let mut random = 0xe703_7ed1_a0b4_28dbu64;
+    for _ in 0..96 {
+        cuts.insert(verification_random(&mut random) % full_len);
+    }
+
+    for cut in cuts {
+        let target = copy_test_database(&source)?;
+        let file = OpenOptions::new().write(true).open(&target)?;
+        file.set_len(cut)?;
+        file.sync_all()?;
+        drop(file);
+        assert!(
+            Database::open(&target).is_err(),
+            "truncated compacted image was accepted at {cut}/{full_len}"
+        );
+        assert_eq!(fs::metadata(&target)?.len(), cut);
+        remove_test_database(&target)?;
+    }
+    remove_test_database(&source)?;
+    Ok(())
+}
+
+#[test]
+fn compacted_base_fuzz_detects_single_bit_corruption() -> Result<()> {
+    let (source, base_offset, base_size) = compacted_damage_fixture()?;
+    let mut offsets = BTreeSet::from([
+        base_offset,
+        base_offset + BASE_HEADER as u64 - 1,
+        base_offset + BASE_HEADER as u64,
+        base_offset + base_size / 2,
+        base_offset + base_size - 1,
+    ]);
+    let mut random = 0x8ebc_6af0_9c88_c6e3u64;
+    for _ in 0..128 {
+        offsets.insert(base_offset + verification_random(&mut random) % base_size);
+    }
+
+    for offset in offsets {
+        let target = copy_test_database(&source)?;
+        let original_len = fs::metadata(&target)?.len();
+        let mut file = OpenOptions::new().read(true).write(true).open(&target)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut byte = [0];
+        file.read_exact(&mut byte)?;
+        byte[0] ^= 1;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&byte)?;
+        file.sync_all()?;
+        drop(file);
+
+        let error = Database::open_with_options(
+            &target,
+            DatabaseOptions::default().with_verification(VerificationMode::Full),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("Base corruption at offset {offset} was accepted"));
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert_eq!(fs::metadata(&target)?.len(), original_len);
+        remove_test_database(&target)?;
+    }
+    remove_test_database(&source)?;
     Ok(())
 }
 

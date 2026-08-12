@@ -357,6 +357,7 @@ impl Database {
         } else {
             self.overlay.install_tail(staged, mutations);
         }
+        failpoints::crash_process_if_requested("after_batch_publish");
         Ok(())
     }
 
@@ -697,8 +698,8 @@ mod failpoints {
     pub fn crash_process_if_requested(point: &str) {
         if std::env::var_os("LKV_TEST_CRASH_POINT").as_deref() == Some(std::ffi::OsStr::new(point))
         {
-            // Deliberately skip destructors to model a process disappearing between
-            // commit phases. Exit code 86 distinguishes the injected crash.
+            // Deliberately skip destructors to model a process disappearing between commit phases.
+            // Exit code 86 distinguishes the injected crash.
             std::process::exit(86);
         }
     }

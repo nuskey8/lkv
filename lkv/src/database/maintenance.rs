@@ -64,6 +64,7 @@ impl Database {
         if let Err(error) = write_compact_marker(&mut self.storage) {
             return self.rollback_or_poison(rollback_offset, error);
         }
+        failpoints::crash_process_if_requested("after_compact_marker_write");
         if let Err(error) = self.storage.seek(SeekFrom::Start(source_offset)) {
             return self.rollback_or_poison(rollback_offset, error.into());
         }
@@ -83,6 +84,7 @@ impl Database {
                 Error::other("base size changed while compacting"),
             );
         }
+        failpoints::crash_process_if_requested("after_compact_base_write");
         if let Err(error) = self.storage.sync_data() {
             return self.rollback_or_poison(rollback_offset, error);
         }
@@ -97,9 +99,12 @@ impl Database {
             source_end,
             written.metadata_checksum,
         );
-        if let Err(error) = superblock::write(&mut self.storage, source_superblock)
-            .and_then(|()| self.storage.sync_all())
-        {
+        if let Err(error) = superblock::write(&mut self.storage, source_superblock) {
+            self.state = HandleState::WritePoisoned;
+            return Err(error);
+        }
+        failpoints::crash_process_if_requested("after_compact_superblock_write");
+        if let Err(error) = self.storage.sync_all() {
             self.state = HandleState::WritePoisoned;
             return Err(error);
         }
@@ -121,8 +126,10 @@ impl Database {
                 "base size changed while relocating compaction output",
             ));
         }
+        failpoints::crash_process_if_requested("after_compact_destination_base_write");
         self.storage.seek(SeekFrom::Start(destination_end))?;
         write_compact_marker(&mut self.storage)?;
+        failpoints::crash_process_if_requested("after_compact_relocation_marker_write");
         self.storage.sync_data()?;
         failpoints::crash_process_if_requested("after_compact_relocation_sync");
 
@@ -135,16 +142,22 @@ impl Database {
             destination_end,
             destination_written.metadata_checksum,
         );
-        if let Err(error) = superblock::write(&mut self.storage, destination_superblock)
-            .and_then(|()| self.storage.sync_all())
-        {
+        if let Err(error) = superblock::write(&mut self.storage, destination_superblock) {
+            self.state = HandleState::WritePoisoned;
+            return Err(error);
+        }
+        failpoints::crash_process_if_requested("after_compact_destination_superblock_write");
+        if let Err(error) = self.storage.sync_all() {
             self.state = HandleState::WritePoisoned;
             return Err(error);
         }
         failpoints::crash_process_if_requested("after_compact_destination_superblock_sync");
-        if let Err(error) = superblock::write_redundant(&mut self.storage, destination_superblock)
-            .and_then(|()| self.storage.sync_all())
-        {
+        if let Err(error) = superblock::write_redundant(&mut self.storage, destination_superblock) {
+            self.state = HandleState::WritePoisoned;
+            return Err(error);
+        }
+        failpoints::crash_process_if_requested("after_compact_redundant_superblock_write");
+        if let Err(error) = self.storage.sync_all() {
             self.state = HandleState::WritePoisoned;
             return Err(error);
         }
@@ -155,9 +168,9 @@ impl Database {
         // so replacing our final Base mapping is sufficient on every supported OS.
         self.state = HandleState::Unavailable;
         self.base = detached;
-        self.storage
-            .set_len(destination_end)
-            .and_then(|()| self.storage.sync_all())?;
+        self.storage.set_len(destination_end)?;
+        failpoints::crash_process_if_requested("after_compact_truncate");
+        self.storage.sync_all()?;
         failpoints::crash_process_if_requested("after_compact_truncate_sync");
         if let Err(error) = self.install_superblock(destination_superblock) {
             self.state = HandleState::Unavailable;
